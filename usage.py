@@ -80,6 +80,23 @@ def price_for(model: str) -> tuple[float, float] | None:
     return None
 
 
+def short_model(model: str) -> str:
+    """Compact a model id for display: claude-opus-4-8 -> opus-4.8.
+
+    Strips the vendor prefix and any trailing date suffix, then renders the
+    version components with dots (the first token is the family name). Non-Claude
+    ids (e.g. gpt-5.5) are already short and pass through unchanged.
+    """
+    if model.startswith("claude-"):
+        parts = model[len("claude-"):].split("-")
+        # Drop a trailing date suffix like "20251001".
+        if parts and len(parts[-1]) == 8 and parts[-1].isdigit():
+            parts.pop()
+        name, ver = parts[0], ".".join(parts[1:])
+        return f"{name}-{ver}" if ver else name
+    return model
+
+
 @dataclass
 class Usage:
     """Accumulated token counts for one session (or a grand total)."""
@@ -120,12 +137,25 @@ class Session:
     path: Path
     tool: str = "claude"  # which agent produced it: "claude" or "codex"
     gui: bool = False  # opened in the desktop GUI (has claude-code-sessions metadata)
+    timestamp: str = ""  # ISO 8601 of the last activity seen (for the Date column)
     models: set[str] = field(default_factory=set)
     # usage accumulated per model so each slice is priced at its own rate
     per_model: dict[str, Usage] = field(default_factory=dict)
 
     def usage_for(self, model: str) -> Usage:
         return self.per_model.setdefault(model, Usage())
+
+    @property
+    def primary_model(self) -> str:
+        """The model that produced the most tokens (used for display/pricing)."""
+        if self.per_model:
+            return max(self.per_model.items(), key=lambda kv: kv[1].total_tokens)[0]
+        return next(iter(sorted(self.models)), "<unknown>")
+
+    @property
+    def date(self) -> str:
+        """Just the YYYY-MM-DD of the last activity, or '' if unknown."""
+        return self.timestamp[:10]
 
     @property
     def usage(self) -> Usage:
@@ -180,6 +210,10 @@ def parse_session(path: Path) -> Session | None:
                 continue
 
             rtype = rec.get("type")
+
+            ts = rec.get("timestamp")
+            if ts and ts > session.timestamp:
+                session.timestamp = ts
 
             # Session name: prefer the AI-generated title; fall back to the
             # first user prompt if no title was ever written.
@@ -374,6 +408,7 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     originator = ""
     models: list[str] = []
     user_texts: list[str] = []
+    timestamp = ""
     # token_count.total_token_usage is cumulative; keep the largest seen.
     best_total = 0
     best_usage: dict | None = None
@@ -396,6 +431,10 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
 
             rtype = rec.get("type")
             payload = rec.get("payload") or {}
+
+            ts = rec.get("timestamp")
+            if ts and ts > timestamp:
+                timestamp = ts
 
             if rtype == "session_meta":
                 session_id = payload.get("id") or session_id
@@ -437,6 +476,7 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         path=path,
         tool="codex",
         gui="desktop" in originator.lower(),
+        timestamp=timestamp,
         models=set(models) or {model},
     )
     u = session.usage_for(model)
@@ -473,6 +513,8 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         sessions = sorted(sessions, key=lambda s: s.usage.total_tokens, reverse=True)
     elif sort_key == "name":
         sessions = sorted(sessions, key=lambda s: s.name.lower())
+    elif sort_key == "date":
+        sessions = sorted(sessions, key=lambda s: s.timestamp, reverse=True)
 
     rows = []
     grand = Usage()
@@ -483,11 +525,14 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         grand_cost += s.cost
         # Combine all cache-write buckets into one displayed column.
         cache_write = u.cache_write_5m + u.cache_write_1h + u.cache_write_other
+        # A "+" marks a session that mixed models (priced by the dominant one).
+        model = short_model(s.primary_model) + ("+" if len(s.models) > 1 else "")
         rows.append(
             [
                 _truncate(s.name, 42),
-                s.tool,
+                model,
                 "gui" if s.gui else "cli",
+                s.date or "-",
                 _fmt_int(u.input),
                 _fmt_int(u.output),
                 _fmt_int(u.cache_read),
@@ -497,12 +542,13 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
             ]
         )
 
-    headers = ["Session", "Tool", "Src", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
+    headers = ["Session", "Model", "Src", "Date", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
     by_tool = Counter(s.tool for s in sessions)
     breakdown = ", ".join(f"{n} {tool}" for tool, n in sorted(by_tool.items()))
     total_row = [
         f"TOTAL ({len(sessions)} sessions: {breakdown})",
+        "",
         "",
         "",
         _fmt_int(grand.input),
@@ -538,8 +584,8 @@ def _render(headers: list[str], rows: list[list[str]], total_row: list[str]) -> 
     def fmt(row: list[str]) -> str:
         cells = []
         for i, cell in enumerate(row):
-            # Left-align the name + tool + source columns, right-align numbers.
-            cells.append(cell.ljust(widths[i]) if i <= 2 else cell.rjust(widths[i]))
+            # Left-align the name/model/source/date columns, right-align numbers.
+            cells.append(cell.ljust(widths[i]) if i <= 3 else cell.rjust(widths[i]))
         return "  ".join(cells)
 
     sep = "  ".join("-" * w for w in widths)
@@ -577,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--sort",
-        choices=["cost", "tokens", "name"],
+        choices=["cost", "tokens", "name", "date"],
         default="cost",
         help="sort order for the table (default: cost)",
     )
@@ -621,6 +667,9 @@ def main(argv: list[str] | None = None) -> int:
                     "project": s.project,
                     "tool": s.tool,
                     "source": "gui" if s.gui else "cli",
+                    "date": s.date,
+                    "timestamp": s.timestamp,
+                    "primary_model": s.primary_model,
                     "models": sorted(s.models),
                     "input_tokens": u.input,
                     "output_tokens": u.output,

@@ -2,7 +2,8 @@
 
 A small tool that scans your local coding-agent session transcripts and reports
 token usage and estimated cost per session. It reads **Claude Code** and
-**Codex** sessions and shows them side by side in one table, tagged by tool.
+**Codex** sessions and shows them side by side in one table, each row labelled
+with the model that produced it.
 
 > ### 🤖 This is vibe coded
 >
@@ -18,6 +19,7 @@ token usage and estimated cost per session. It reads **Claude Code** and
 python usage.py                 # table, sorted by cost (default)
 python usage.py --sort tokens   # sort by total tokens
 python usage.py --sort name     # sort alphabetically
+python usage.py --sort date     # sort by last-activity date, newest first
 python usage.py --json          # machine-readable JSON
 python usage.py --projects-dir /path/to/.claude/projects   # Claude transcripts
 python usage.py --codex-dir /path/to/.codex/sessions       # Codex transcripts
@@ -31,14 +33,18 @@ recent Python 3 (3.10+).
 Example:
 
 ```
-Session                                Tool    Src    Input   Output    Cache rd   Cache wr       Total    Cost
--------------------------------------  ------  ---  -------  -------  ----------  ---------  ----------  ------
-PR review helper tool                  claude  gui   53,236  190,806  20,270,198    444,956  20,959,196  $19.62
-Please add specialization to load_k...  codex   cli  581,211   29,739   5,130,880          0   5,741,830   $6.36
+Session                                Model     Src  Date           Input   Output    Cache rd   Cache wr       Total    Cost
+-------------------------------------  --------  ---  ----------  --------  -------  ----------  ---------  ----------  ------
+PR review helper tool                  opus-4.8  gui  2026-06-15    53,236  190,806  20,270,198    444,956  20,959,196  $19.62
+Sync CLAUDE.md and AGENTS.md           gpt-5.5   gui  2026-06-29   124,629   26,911   1,577,600          0   1,729,140   $2.22
 ...
--------------------------------------  ------  ---  -------  -------  ----------  ---------  ----------  ------
-TOTAL (24 sessions: 18 claude, 6 codex)            973,735  954,089 103,298,005  2,637,466 107,863,295  $106.05
+-------------------------------------  --------  ---  ----------  --------  -------  ----------  ---------  ----------  ------
+TOTAL (24 sessions: 18 claude, 6 codex)                          973,735  954,089 103,298,005  2,637,466 107,863,295 $106.05
 ```
+
+The **Model** column shows the (shortened) model that produced most of the
+session's tokens; a trailing `+` marks a session that used more than one model.
+The **Date** is the last activity recorded in the transcript.
 
 ## What it does
 
