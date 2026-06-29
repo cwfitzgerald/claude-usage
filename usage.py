@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Summarize token usage and cost across all local Claude Code sessions.
+"""Summarize token usage and cost across local coding-agent sessions.
 
-Claude Code stores each session as a JSONL transcript under
-``~/.claude/projects/<encoded-project>/<session-id>.jsonl``. Every assistant
-turn carries a ``message.usage`` block with the per-turn token counts. This
-tool walks those transcripts, sums usage per session (deduplicating by API
-message id so a resumed/edited log isn't double-counted), prices each session
-against the model that produced it, and prints a table.
+Supports multiple tools, shown side by side in one table (the **Tool** column):
+
+* **Claude Code** stores each session as a JSONL transcript under
+  ``~/.claude/projects/<encoded-project>/<session-id>.jsonl``. Every assistant
+  turn carries a ``message.usage`` block; we sum usage per session,
+  deduplicating by API message id so a resumed/edited log isn't double-counted.
+
+* **Codex** stores rollout transcripts under
+  ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl``. Each carries periodic
+  ``token_count`` events whose ``total_token_usage`` is *cumulative*, so we
+  just read the final running total — no dedup needed.
+
+Each session is priced against the model that produced it and printed in a
+table.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +55,13 @@ PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-sonnet-4-0": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    # OpenAI / Codex. These reuse the same cost formula as the Claude models:
+    # OpenAI's cached-input rate is 10% of the input rate (== CACHE_READ_MULT),
+    # so codex "cached_input_tokens" map onto our cache_read bucket and price
+    # correctly, and OpenAI has no cache-*write* surcharge (those buckets stay
+    # zero). List prices, USD/MTok, as of 2026-06.
+    "gpt-5.5": (5.0, 30.0),
+    "gpt-5.4": (2.5, 15.0),
 }
 
 # Models we couldn't price (e.g. synthetic ids like "<synthetic>"); recorded so
@@ -102,6 +118,7 @@ class Session:
     session_id: str
     project: str
     path: Path
+    tool: str = "claude"  # which agent produced it: "claude" or "codex"
     gui: bool = False  # opened in the desktop GUI (has claude-code-sessions metadata)
     models: set[str] = field(default_factory=set)
     # usage accumulated per model so each slice is priced at its own rate
@@ -296,6 +313,151 @@ def find_sessions(projects_dir: Path, gui_dir: Path | None = None) -> list[Sessi
     return sessions
 
 
+# ---------------------------------------------------------------------------
+# Codex (~/.codex)
+# ---------------------------------------------------------------------------
+
+def default_codex_dir() -> Path:
+    """Root of Codex's session storage (~/.codex/sessions)."""
+    return Path(os.path.expanduser("~")) / ".codex" / "sessions"
+
+
+def load_codex_index(codex_root: Path) -> dict[str, str]:
+    """Map a Codex session id -> its curated thread name, from session_index.jsonl.
+
+    The index lives next to the ``sessions/`` dir and only covers recent
+    sessions, so callers must have a fallback for ids it doesn't list.
+    """
+    index: dict[str, str] = {}
+    path = codex_root.parent / "session_index.jsonl"
+    if not path.is_file():
+        return index
+    try:
+        fh = path.open(encoding="utf-8")
+    except OSError:
+        return index
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid, name = rec.get("id"), rec.get("thread_name")
+            if sid and name:
+                index[sid] = name
+    return index
+
+
+def _codex_fallback_name(user_texts: list[str]) -> str:
+    """Best-effort session name from the first *real* user prompt.
+
+    Codex injects AGENTS.md / permission blocks as the first user messages, so
+    we skip anything that looks like an instruction block and take the first
+    genuine prompt.
+    """
+    for txt in user_texts:
+        t = txt.strip()
+        if not t or t.startswith(("#", "<")):
+            continue
+        first_line = t.splitlines()[0].strip()
+        return _truncate(first_line, 60)
+    return "(untitled)"
+
+
+def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
+    """Parse one Codex rollout transcript, or None if it has no token usage."""
+    session_id = path.stem
+    cwd = ""
+    originator = ""
+    models: list[str] = []
+    user_texts: list[str] = []
+    # token_count.total_token_usage is cumulative; keep the largest seen.
+    best_total = 0
+    best_usage: dict | None = None
+
+    try:
+        fh = path.open(encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: cannot open {path}: {exc}", file=sys.stderr)
+        return None
+
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            rtype = rec.get("type")
+            payload = rec.get("payload") or {}
+
+            if rtype == "session_meta":
+                session_id = payload.get("id") or session_id
+                cwd = payload.get("cwd") or ""
+                originator = payload.get("originator") or ""
+            elif rtype == "turn_context":
+                m = payload.get("model")
+                if m:
+                    models.append(m)
+            elif rtype == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                tot = info.get("total_token_usage") or {}
+                t = int(tot.get("total_tokens") or 0)
+                if t >= best_total:
+                    best_total, best_usage = t, tot
+            elif rtype == "response_item" and payload.get("role") == "user":
+                for c in payload.get("content") or []:
+                    if isinstance(c, dict) and c.get("type") in ("input_text", "text"):
+                        user_texts.append(c.get("text") or "")
+
+    if not best_usage or best_total == 0:
+        return None  # no recorded usage (e.g. local models that don't report it)
+
+    # Codex's input_tokens INCLUDE the cached ones; split them so the cached
+    # slice is priced at the discounted (cache_read) rate and the rest at full.
+    input_total = int(best_usage.get("input_tokens") or 0)
+    cached = int(best_usage.get("cached_input_tokens") or 0)
+    output = int(best_usage.get("output_tokens") or 0)  # already includes reasoning
+
+    # Pick the model the session mostly ran on for pricing (a session may also
+    # invoke internal models like codex-auto-review; we attribute the aggregate
+    # total to the dominant one).
+    model = max(set(models), key=models.count) if models else "<unknown>"
+
+    session = Session(
+        name=index.get(session_id) or _codex_fallback_name(user_texts),
+        session_id=session_id,
+        project=cwd,
+        path=path,
+        tool="codex",
+        gui="desktop" in originator.lower(),
+        models=set(models) or {model},
+    )
+    u = session.usage_for(model)
+    u.input = max(0, input_total - cached)
+    u.cache_read = cached
+    u.output = output
+    return session
+
+
+def find_codex_sessions(codex_root: Path) -> list[Session]:
+    if not codex_root.is_dir():
+        return []
+    index = load_codex_index(codex_root)
+    sessions: list[Session] = []
+    for path in sorted(codex_root.glob("**/rollout-*.jsonl")):
+        s = parse_codex_rollout(path, index)
+        if s is not None:
+            sessions.append(s)
+    return sessions
+
+
 def _fmt_int(n: int) -> str:
     return f"{n:,}"
 
@@ -324,6 +486,7 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         rows.append(
             [
                 _truncate(s.name, 42),
+                s.tool,
                 "gui" if s.gui else "cli",
                 _fmt_int(u.input),
                 _fmt_int(u.output),
@@ -334,11 +497,13 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
             ]
         )
 
-    headers = ["Session", "Src", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
+    headers = ["Session", "Tool", "Src", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
-    gui_count = sum(1 for s in sessions if s.gui)
+    by_tool = Counter(s.tool for s in sessions)
+    breakdown = ", ".join(f"{n} {tool}" for tool, n in sorted(by_tool.items()))
     total_row = [
-        f"TOTAL ({len(sessions)} sessions, {gui_count} gui)",
+        f"TOTAL ({len(sessions)} sessions: {breakdown})",
+        "",
         "",
         _fmt_int(grand.input),
         _fmt_int(grand.output),
@@ -354,7 +519,7 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         print(
             "\nwarning: no pricing for "
             + ", ".join(sorted(_UNKNOWN_MODELS))
-            + " — their cost is reported as $0.00.",
+            + " - their cost is reported as $0.00.",
             file=sys.stderr,
         )
 
@@ -373,8 +538,8 @@ def _render(headers: list[str], rows: list[list[str]], total_row: list[str]) -> 
     def fmt(row: list[str]) -> str:
         cells = []
         for i, cell in enumerate(row):
-            # Left-align the name + source columns, right-align numbers/cost.
-            cells.append(cell.ljust(widths[i]) if i <= 1 else cell.rjust(widths[i]))
+            # Left-align the name + tool + source columns, right-align numbers.
+            cells.append(cell.ljust(widths[i]) if i <= 2 else cell.rjust(widths[i]))
         return "  ".join(cells)
 
     sep = "  ".join("-" * w for w in widths)
@@ -405,6 +570,12 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--codex-dir",
+        type=Path,
+        default=default_codex_dir(),
+        help=f"Codex sessions directory (default: {default_codex_dir()})",
+    )
+    parser.add_argument(
         "--sort",
         choices=["cost", "tokens", "name"],
         default="cost",
@@ -421,20 +592,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {args.projects_dir} is not a directory", file=sys.stderr)
         return 1
 
-    sessions = find_sessions(args.projects_dir, args.gui_dir)
+    claude_sessions = find_sessions(args.projects_dir, args.gui_dir)
+    sessions = claude_sessions + find_codex_sessions(args.codex_dir)
 
     # A missing GUI metadata dir is a normal state (CLI-only machine), so we
     # stay quiet about it. Only warn when the dir IS present but nothing matched
     # — that's the surprising case worth flagging.
     if (
-        sessions
-        and not any(s.gui for s in sessions)
+        claude_sessions
+        and not any(s.gui for s in claude_sessions)
         and args.gui_dir.is_dir()
     ):
         n = len(load_gui_metadata(args.gui_dir))
         print(
             f"note: GUI metadata dir {args.gui_dir} has {n} entries but none "
-            f"matched a scanned transcript — all sessions shown as 'cli'.",
+            f"matched a scanned transcript - all sessions shown as 'cli'.",
             file=sys.stderr,
         )
 
@@ -447,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
                     "name": s.name,
                     "session_id": s.session_id,
                     "project": s.project,
+                    "tool": s.tool,
                     "source": "gui" if s.gui else "cli",
                     "models": sorted(s.models),
                     "input_tokens": u.input,
