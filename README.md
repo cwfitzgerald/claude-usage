@@ -20,6 +20,10 @@ python usage.py                 # table, sorted by cost (default)
 python usage.py --sort tokens   # sort by total tokens
 python usage.py --sort name     # sort alphabetically
 python usage.py --sort date     # sort by last-activity date, newest first
+python usage.py --since 7d      # only sessions active in the last 7 days
+python usage.py --since 24h     # ...the last 24 hours (units: h/d/w/mo)
+python usage.py --since 3mo     # ...the last 3 months
+python usage.py --since 2026-06-01  # ...on or after an absolute date
 python usage.py --json          # machine-readable JSON
 python usage.py --projects-dir /path/to/.claude/projects   # Claude transcripts
 python usage.py --codex-dir /path/to/.codex/sessions       # Codex transcripts

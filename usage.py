@@ -20,11 +20,14 @@ table.
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -597,6 +600,74 @@ def _render(headers: list[str], rows: list[list[str]], total_row: list[str]) -> 
     print(fmt(total_row))
 
 
+# ---------------------------------------------------------------------------
+# Date filtering (--since)
+# ---------------------------------------------------------------------------
+
+# Units expressible as a fixed number of seconds (months are handled separately
+# since their length varies). Both short and spelled-out forms are accepted.
+_DURATION_SECONDS: dict[str, int] = {
+    "h": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "week": 604800, "weeks": 604800,
+}
+_MONTH_UNITS = {"mo", "month", "months"}
+
+
+def parse_iso(ts: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp into a timezone-aware datetime, or None.
+
+    Transcript timestamps are UTC with a trailing 'Z'; a naive timestamp (no
+    offset) is assumed to be UTC so comparisons against the cutoff are sound.
+    """
+    if not ts:
+        return None
+    s = ts.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _subtract_months(dt: datetime, months: int) -> datetime:
+    """Go back `months` calendar months, clamping the day to the target month."""
+    idx = dt.year * 12 + (dt.month - 1) - months
+    year, month = divmod(idx, 12)
+    month += 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def parse_since(spec: str, now: datetime) -> datetime:
+    """Resolve a --since value to a cutoff datetime (timezone-aware, UTC).
+
+    Accepts a relative duration like '7d', '24h', '2w', or '3mo' (units:
+    h/hours, d/days, w/weeks, mo/months) measured back from `now`, or an
+    absolute date/datetime such as '2026-06-01' or '2026-06-01T12:00:00'.
+    """
+    m = re.fullmatch(r"(\d+)\s*([a-zA-Z]+)", spec.strip())
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        if unit in _MONTH_UNITS:
+            return _subtract_months(now, n)
+        if unit in _DURATION_SECONDS:
+            return now - timedelta(seconds=n * _DURATION_SECONDS[unit])
+        raise argparse.ArgumentTypeError(
+            f"unknown duration unit {unit!r} in --since {spec!r}; "
+            "use h, d, w, or mo"
+        )
+    dt = parse_iso(spec)
+    if dt is not None:
+        return dt
+    raise argparse.ArgumentTypeError(
+        f"could not parse --since {spec!r}; use a duration like '7d', '24h', "
+        "'2w', '3mo', or an absolute date like '2026-06-01'"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     default_dir = Path(os.path.expanduser("~")) / ".claude" / "projects"
     parser = argparse.ArgumentParser(description=__doc__)
@@ -628,6 +699,15 @@ def main(argv: list[str] | None = None) -> int:
         help="sort order for the table (default: cost)",
     )
     parser.add_argument(
+        "--since",
+        metavar="WHEN",
+        help=(
+            "only include sessions active at or after WHEN: a relative duration "
+            "like '7d', '24h', '2w', '3mo' (units h/d/w/mo), or an absolute date "
+            "like '2026-06-01'"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="emit JSON instead of a table",
@@ -640,6 +720,26 @@ def main(argv: list[str] | None = None) -> int:
 
     claude_sessions = find_sessions(args.projects_dir, args.gui_dir)
     sessions = claude_sessions + find_codex_sessions(args.codex_dir)
+
+    if args.since is not None:
+        try:
+            cutoff = parse_since(args.since, datetime.now(timezone.utc))
+        except argparse.ArgumentTypeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        before = len(sessions)
+        # A session with no parseable timestamp can't be placed in the window,
+        # so it's excluded rather than silently kept.
+        sessions = [
+            s
+            for s in sessions
+            if (dt := parse_iso(s.timestamp)) is not None and dt >= cutoff
+        ]
+        print(
+            f"note: --since {args.since} -> showing {len(sessions)} of {before} "
+            f"sessions active since {cutoff.date()}.",
+            file=sys.stderr,
+        )
 
     # A missing GUI metadata dir is a normal state (CLI-only machine), so we
     # stay quiet about it. Only warn when the dir IS present but nothing matched
