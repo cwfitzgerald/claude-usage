@@ -46,6 +46,29 @@ TOTAL (18 sessions, 11 gui)                 162,063  786,009  75,241,861  2,393,
 - Prices each session against the model that produced it, including the
   separate 1-hour vs 5-minute cache-write rates when the log records them.
 
+## Why these numbers are *lower* than the desktop app's "Breakdown"
+
+If you compare a session here against the **Breakdown** panel in the desktop
+app, this tool will report fewer tokens — often roughly half to a third. **This
+tool is the accurate one; the app's panel over-counts.**
+
+Here's why. A single assistant API response is written to the transcript as
+*several* JSONL lines — one per content block (a `thinking` block, a `text`
+block, each `tool_use` block) — and **every one of those lines repeats the same
+`usage` object**. One response with `[thinking, text, tool_use, tool_use]`
+becomes four lines, all carrying identical `input` / `output` / `cache_read` /
+`cache_write` counts and the same `requestId`. It was billed *once*.
+
+This tool dedupes by API `message.id`, so it counts that response once. The
+desktop app's Breakdown panel appears to tally the blocks separately, inflating
+every multi-block turn by its block count (~2–3× in practice). Anthropic bills
+per API call, so the deduped figure is the one that matches real cost.
+
+Across a full set of transcripts here, 575 of 742 unique message ids spanned
+multiple lines, and **none** of them carried differing usage between those lines
+— confirming the duplicates are always the same response re-rendered, never
+distinct billed calls. Deduping never drops real tokens.
+
 ## GUI vs CLI sessions
 
 The desktop app ("Cowork" / Claude Code in the GUI) doesn't keep separate token
