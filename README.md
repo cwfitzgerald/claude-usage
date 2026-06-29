@@ -1,0 +1,100 @@
+# claude-usage
+
+A small tool that scans your local Claude Code session transcripts and reports
+token usage and estimated cost per session.
+
+> ### 🤖 This is vibe coded
+>
+> This entire tool — code, docs, and this very sentence — was written by Claude
+> (Claude Code) through conversational prompting, with light human steering. It
+> has **not** been carefully audited line by line. Treat the numbers as a
+> useful approximation, not an invoice. Read [`usage.py`](usage.py) before
+> trusting it with anything that matters. PRs and fixes welcome.
+
+## Usage
+
+```sh
+python usage.py                 # table, sorted by cost (default)
+python usage.py --sort tokens   # sort by total tokens
+python usage.py --sort name     # sort alphabetically
+python usage.py --json          # machine-readable JSON
+python usage.py --projects-dir /path/to/.claude/projects
+```
+
+By default it reads `~/.claude/projects/*/*.jsonl`. No dependencies beyond a
+recent Python 3 (3.10+).
+
+Example:
+
+```
+Session                                Src    Input   Output    Cache rd   Cache wr       Total    Cost
+-------------------------------------  ---  -------  -------  ----------  ---------  ----------  ------
+PR review helper tool                  gui   53,236  190,806  20,270,198    444,956  20,959,196  $19.62
+...
+-------------------------------------  ---  -------  -------  ----------  ---------  ----------  ------
+TOTAL (18 sessions, 11 gui)                 162,063  786,009  75,241,861  2,393,487  78,583,420  $82.02
+```
+
+## What it does
+
+- Walks every session transcript (`<project>/<session-id>.jsonl`).
+- Sums each assistant turn's `message.usage`, deduplicating by API message id
+  so resumed/replayed logs aren't double-counted.
+- Splits tokens into **input**, **output**, **cache read**, and **cache write**.
+- Names each session by its AI-generated title (`ai-title` record), falling
+  back to the first summary, then `(untitled)`.
+- Prices each session against the model that produced it, including the
+  separate 1-hour vs 5-minute cache-write rates when the log records them.
+
+## GUI vs CLI sessions
+
+The desktop app ("Cowork" / Claude Code in the GUI) doesn't keep separate token
+data — it runs the bundled CLI, so its transcripts land in the **same**
+`~/.claude/projects/` directory and are already counted. The app only adds a
+metadata layer (curated title, cwd, model), keyed by the CLI session id, in the
+desktop app's data dir. The tool checks the known locations:
+
+- `%APPDATA%\Claude\claude-code-sessions` — normal Windows install.
+- `%LOCALAPPDATA%\Packages\Claude*\LocalCache\Roaming\Claude\claude-code-sessions`
+  — **packaged (MSIX/Microsoft Store) install**, where Windows redirects the
+  app's `%APPDATA%` into its package container.
+- `~/Library/Application Support/Claude/claude-code-sessions` — macOS.
+
+It uses the first that exists to:
+
+- mark each row `gui` or `cli` in the **Src** column, and
+- prefer the app's curated session title.
+
+Point it elsewhere with `--gui-dir`. If no metadata dir exists (CLI-only
+machine), every row is shown as `cli` — which is correct, and the cost totals
+are unaffected.
+
+## Cost model
+
+Cost is an estimate based on published per-MTok rates (`PRICING` in
+[`usage.py`](usage.py)), with the standard cache multipliers applied to the
+input rate:
+
+| Token type            | Multiplier vs input rate |
+| --------------------- | ------------------------ |
+| Cache read            | 0.1×                     |
+| Cache write (5-min)   | 1.25×                    |
+| Cache write (1-hour)  | 2.0×                     |
+
+Models without a pricing entry are reported with `$0.00` and a stderr warning;
+add them to `PRICING` to fix. These are **list prices** and don't reflect any
+subscription/plan billing — treat the totals as an approximation, not a bill.
+
+## License
+
+Licensed under any of:
+
+- [MIT license](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [zlib license](LICENSE-ZLIB)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you shall be licensed as above, without any
+additional terms or conditions.
