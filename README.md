@@ -38,18 +38,21 @@ recent Python 3 (3.10+).
 Example:
 
 ```
-Date        Session                                     Model                Input  Output  Cache rd  Cache wr   Total    Cost
-----------  ------------------------------------------  ------------------  ------  ------  --------  --------  ------  ------
-2026-06-30  wgpu PR #8388 review feedback               opus-4.8             17.2K  250.9K     52.3M    391.2K   53.0M  $36.43
-2026-06-30  wgpu wiki documentation migration           opus-4.8             63.0K  287.6K     26.3M    514.7K   27.1M  $25.78
-2026-06-29  Claude session token usage analyzer         opus-4.8             42.6K  136.5K     25.1M    611.6K   25.8M  $22.27
-2026-06-29  DX12/Vulkan swapchain synchronization       opus-4.8             12.4K  163.4K     16.6M    541.1K   17.4M  $17.87
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr     Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
+2026-06-30  wgpu PR #8388 review feedback               opus-4.8             17.2K  250.9K     52.3M    391.2K   $36.43
+2026-06-30  wgpu wiki documentation migration           opus-4.8             63.0K  287.6K     26.3M    514.7K   $25.78
+2026-06-29  Claude session token usage analyzer         opus-4.8             42.6K  136.5K     25.1M    611.6K   $22.27
+2026-06-29  DX12/Vulkan swapchain synchronization       opus-4.8             12.4K  163.4K     16.6M    541.1K   $17.87
 ...
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
+TOTAL                                                                       511.8K    1.4M    258.9M      4.1M  $223.32
 Averages  $18.61 per session (12: 10 claude, 2 codex) · $55.83 per active day (4) · $55.83 per calendar day (4d span)
 ```
 
 The table sorts by cost (default) and leads with the **Date** of last activity.
-Below it is an **Averages** line: cost per session (with the session count and
+A grand-**TOTAL** row sums every token/cost column, and below it an **Averages**
+line: cost per session (with the session count and
 per-tool breakdown), and two cost-per-day rates — over *active* days (distinct
 dates that actually had a session) and over the full *calendar* span (first to
 last date, idle days included). The first answers "what a day I use it costs,"
@@ -79,13 +82,13 @@ subagent indented beneath it. The rollup's Model is left blank when the base and
 subagents didn't all run on the same model:
 
 ```
-Date        Session                                     Model                Input  Output  Cache rd  Cache wr   Total    Cost
-----------  ------------------------------------------  ------------------  ------  ------  --------  --------  ------  ------
-2026-07-02  Memory allocator for wgpu-hal                                    79.9K  175.2K     92.6M      2.0M   94.8M  $70.26
-            ├─ main                                     fable-5               6.4K   65.2K      2.2M    278.3K    2.6M  $11.13
-            ├─ Fix soundness findings in allocator      opus-4.8             17.4K   21.8K     34.6M    273.4K   34.9M  $19.62
-            ├─ Research VMA algorithms                  opus-4.8              5.1K   16.3K      3.2M    124.8K    3.4M   $2.82
-            └─ Re-verify soundness fixes                opus-4.8              5.8K      28    323.9K    108.7K  438.4K   $0.87
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr     Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
+2026-07-02  Memory allocator for wgpu-hal                                    79.9K  175.2K     92.6M      2.0M   $70.26
+            ├─ main                                     fable-5               6.4K   65.2K      2.2M    278.3K   $11.13
+            ├─ Fix soundness findings in allocator      opus-4.8             17.4K   21.8K     34.6M    273.4K   $19.62
+            ├─ Research VMA algorithms                  opus-4.8              5.1K   16.3K      3.2M    124.8K    $2.82
+            └─ Re-verify soundness fixes                opus-4.8              5.8K      28    323.9K    108.7K    $0.87
 ```
 
 The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`└─`,
@@ -99,8 +102,8 @@ Claude subagents are labelled by their `description` from the `.meta.json`
 sidecar (falling back to the agent `type`, e.g. `Explore`, when none was
 recorded); Codex subagents are labelled by their `agent_nickname` (an unnamed
 one, like an automatic `codex-auto-review` pass, shows as `(subagent)`).
-Sessions with no subagents stay as a single flat row. Sorting uses each
-conversation's rollup (base + subagents) figure.
+Sessions with no subagents stay as a single flat row. The **TOTAL** row and all
+sorting use each conversation's rollup (base + subagents) figure.
 
 `--sort` applies within a conversation too: the subagents are ordered by the
 same key (e.g. by cost under `--sort cost`), with `main` always pinned directly

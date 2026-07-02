@@ -815,7 +815,6 @@ def _usage_cells(
         _fmt_compact(u.output),
         _fmt_compact(u.cache_read),
         _fmt_compact(cache_write),
-        _fmt_compact(u.total_tokens),
         f"${cost:,.2f}",
     ]
 
@@ -844,8 +843,8 @@ def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
 _RESET = "\033[0m"
 
 # Column layout, referenced when styling individual cells.
-_COST_COL = 8
-_TOKEN_COLS = (3, 4, 5, 6, 7)  # input, output, cache rd, cache wr, total
+_COST_COL = 7
+_TOKEN_COLS = (3, 4, 5, 6)  # input, output, cache rd, cache wr
 
 # Base SGR parameters per row kind, so the parts of a conversation read at a
 # glance: the bold rollup is the whole-conversation headline, cyan is the base
@@ -858,6 +857,7 @@ _ROW_PARAMS = {
     "rollup": ["1"],       # bold  — the whole-conversation total
     "main": ["36"],        # cyan  — the base agent
     "sub": ["2"],          # dim   — an indented subagent
+    "total": ["1"],        # bold  — the grand total
 }
 
 
@@ -885,11 +885,11 @@ def _row_styles(kind: str, cells: list[str], cost: float) -> list[str]:
     """Per-cell SGR codes for a body/total row: kind color, plus a cost tint
     and dimmed zeros layered on top of it."""
     base = _ROW_PARAMS[kind]
-    bold_kind = kind == "rollup"
+    bold_kind = kind in ("rollup", "total")
     styles = []
     for i, cell in enumerate(cells):
         if i == _COST_COL:
-            # Keep the rollup bold so the tinted cost still reads as a total.
+            # Keep the rollup/total bold so the tinted cost still reads as a total.
             params = _cost_params(cost)
             styles.append(_sgr(["1"] + params if bold_kind else params))
         elif i in _TOKEN_COLS and cell == "0":
@@ -949,8 +949,10 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         return (cells, _row_styles(kind, cells, cost))
 
     rows = []
+    grand = Usage()
     grand_cost = 0.0
     for s in sessions:
+        grand.add(s.total_usage)
         grand_cost += s.total_cost
 
         if not s.subagents:
@@ -987,9 +989,21 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
                 sa.usage, sa.cost,
             ), sa.cost))
 
-    headers = ["Date", "Session", "Model", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
+    headers = ["Date", "Session", "Model", "Input", "Output", "Cache rd", "Cache wr", "Cost"]
+    gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
+    total_cells = [
+        "TOTAL",
+        "",
+        "",
+        _fmt_compact(grand.input),
+        _fmt_compact(grand.output),
+        _fmt_compact(grand.cache_read),
+        _fmt_compact(gw),
+        f"${grand_cost:,.2f}",
+    ]
+    total_row = body_row("total", total_cells, grand_cost)
 
-    _render(headers, rows, color)
+    _render(headers, rows, total_row, color)
     _print_averages(sessions, grand_cost, color)
 
     if _UNKNOWN_MODELS:
@@ -1036,11 +1050,12 @@ def _truncate(s: str, width: int) -> str:
 def _render(
     headers: list[str],
     rows: list[tuple[list[str], list[str]]],
+    total_row: tuple[list[str], list[str]],
     color: bool = False,
 ) -> None:
     cols = len(headers)
     widths = [len(h) for h in headers]
-    for cells, _ in rows:
+    for cells, _ in [*rows, total_row]:
         for i in range(cols):
             widths[i] = max(widths[i], len(cells[i]))
 
@@ -1063,6 +1078,9 @@ def _render(
     print(fmt(sep_cells, [sep_style] * cols))
     for cells, styles in rows:
         print(fmt(cells, styles))
+    print(fmt(sep_cells, [sep_style] * cols))
+    total_cells, total_styles = total_row
+    print(fmt(total_cells, total_styles))
 
 
 # ---------------------------------------------------------------------------
