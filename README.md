@@ -65,8 +65,9 @@ suppressed with `--color always|never`.
 The **Model** column shows the (shortened) model that produced most of the
 session's tokens; a trailing `+` marks a session that used more than one model,
 and a trailing `(low)` / `(medium)` / `(xhigh)` shows the reasoning effort when
-the transcript records one (Codex only — Claude Code doesn't persist it). The
-**Date** is the last activity recorded in the transcript.
+the transcript records one (Codex only — Claude Code doesn't persist it). A few
+unwieldy ids get an explicit short alias (e.g. `codex-auto-review` shows as
+`cdx-ar`). The **Date** is the last activity recorded in the transcript.
 
 ### Subagents
 

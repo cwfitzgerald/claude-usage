@@ -94,13 +94,22 @@ def price_for(model: str) -> tuple[float, float] | None:
     return None
 
 
+# Explicit short aliases for model ids too long to display comfortably.
+_MODEL_ALIASES = {
+    "codex-auto-review": "cdx-ar",
+}
+
+
 def short_model(model: str) -> str:
     """Compact a model id for display: claude-opus-4-8 -> opus-4.8.
 
     Strips the vendor prefix and any trailing date suffix, then renders the
     version components with dots (the first token is the family name). Non-Claude
-    ids (e.g. gpt-5.5) are already short and pass through unchanged.
+    ids (e.g. gpt-5.5) are already short and pass through unchanged, except for a
+    few overly long ids that get an explicit short alias.
     """
+    if model in _MODEL_ALIASES:
+        return _MODEL_ALIASES[model]
     if model.startswith("claude-"):
         parts = model[len("claude-"):].split("-")
         # Drop a trailing date suffix like "20251001".
