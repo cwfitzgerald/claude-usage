@@ -7,6 +7,10 @@ Supports multiple tools, shown side by side in one table (the **Tool** column):
   ``~/.claude/projects/<encoded-project>/<session-id>.jsonl``. Every assistant
   turn carries a ``message.usage`` block; we sum usage per session,
   deduplicating by API message id so a resumed/edited log isn't double-counted.
+  Subagents (Task/Agent tool) each get their own transcript under
+  ``<session-id>/subagents/agent-*.jsonl`` and often run a different model than
+  the base conversation, so they're parsed separately and shown as their own
+  indented rows beneath a whole-conversation rollup line.
 
 * **Codex** stores rollout transcripts under
   ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl``. Each carries periodic
@@ -62,9 +66,14 @@ PRICING: dict[str, tuple[float, float]] = {
     # OpenAI's cached-input rate is 10% of the input rate (== CACHE_READ_MULT),
     # so codex "cached_input_tokens" map onto our cache_read bucket and price
     # correctly, and OpenAI has no cache-*write* surcharge (those buckets stay
-    # zero). List prices, USD/MTok, as of 2026-06.
-    "gpt-5.5": (5.0, 30.0),
-    "gpt-5.4": (2.5, 15.0),
+    # zero). Standard-tier list prices, USD/MTok (there's also a pricier
+    # "priority" tier we don't model), as of 2026-07.
+    "gpt-5.5": (2.5, 15.0),
+    "gpt-5.5-pro": (15.0, 90.0),
+    "gpt-5.4": (1.25, 7.5),
+    "gpt-5.4-mini": (0.375, 2.25),
+    "gpt-5.4-nano": (0.10, 0.625),
+    "gpt-5.4-pro": (15.0, 90.0),
 }
 
 # Models we couldn't price (e.g. synthetic ids like "<synthetic>"); recorded so
@@ -76,10 +85,12 @@ def price_for(model: str) -> tuple[float, float] | None:
     """Return (input_rate, output_rate) per MTok for a model id, or None."""
     if model in PRICING:
         return PRICING[model]
-    # Tolerate dated suffixes like "claude-haiku-4-5-20251001".
-    for known, rates in PRICING.items():
+    # Tolerate dated suffixes like "claude-haiku-4-5-20251001". Try the longest
+    # (most specific) known id first so "gpt-5.4-mini-<date>" matches
+    # "gpt-5.4-mini" rather than the shorter "gpt-5.4".
+    for known in sorted(PRICING, key=len, reverse=True):
         if model.startswith(known):
-            return rates
+            return PRICING[known]
     return None
 
 
@@ -132,6 +143,99 @@ class Usage:
         )
 
 
+def sum_usage(per_model: dict[str, Usage]) -> Usage:
+    """Collapse a per-model usage map into one aggregate Usage."""
+    total = Usage()
+    for u in per_model.values():
+        total.add(u)
+    return total
+
+
+def cost_of(per_model: dict[str, Usage]) -> float:
+    """Price a per-model usage map, each slice at its own model's rate."""
+    total = 0.0
+    for model, u in per_model.items():
+        rates = price_for(model)
+        if rates is None:
+            _UNKNOWN_MODELS.add(model)
+            continue
+        in_rate, out_rate = rates
+        total += (u.input / 1e6) * in_rate
+        total += (u.output / 1e6) * out_rate
+        total += (u.cache_read / 1e6) * in_rate * CACHE_READ_MULT
+        total += (u.cache_write_5m / 1e6) * in_rate * CACHE_WRITE_5M_MULT
+        total += (u.cache_write_1h / 1e6) * in_rate * CACHE_WRITE_1H_MULT
+        # Unbroken-down cache creation: price at the 5-min rate (the common case).
+        total += (u.cache_write_other / 1e6) * in_rate * CACHE_WRITE_5M_MULT
+    return total
+
+
+def primary_model_of(per_model: dict[str, Usage], models: set[str]) -> str:
+    """The model that produced the most tokens (used for display/pricing)."""
+    if per_model:
+        return max(per_model.items(), key=lambda kv: kv[1].total_tokens)[0]
+    return next(iter(sorted(models)), "<unknown>")
+
+
+def _accumulate(usage: dict, u: Usage) -> None:
+    """Fold one assistant turn's ``message.usage`` block into ``u``."""
+    u.input += int(usage.get("input_tokens") or 0)
+    u.output += int(usage.get("output_tokens") or 0)
+    u.cache_read += int(usage.get("cache_read_input_tokens") or 0)
+
+    created = int(usage.get("cache_creation_input_tokens") or 0)
+    breakdown = usage.get("cache_creation") or {}
+    wrote_1h = int(breakdown.get("ephemeral_1h_input_tokens") or 0)
+    wrote_5m = int(breakdown.get("ephemeral_5m_input_tokens") or 0)
+    if wrote_1h or wrote_5m:
+        u.cache_write_1h += wrote_1h
+        u.cache_write_5m += wrote_5m
+        # Any remainder the breakdown didn't account for.
+        u.cache_write_other += max(0, created - wrote_1h - wrote_5m)
+    else:
+        u.cache_write_other += created
+
+
+@dataclass
+class SubAgent:
+    """One Task/Agent subagent spawned within a session, with its own model.
+
+    Claude Code stores each subagent's transcript under
+    ``<session-id>/subagents/agent-*.jsonl`` next to a ``.meta.json`` sidecar
+    holding its ``agentType`` and ``description``.
+    """
+
+    agent_type: str = ""
+    description: str = ""
+    timestamp: str = ""
+    effort: str = ""  # reasoning effort, if recorded (Codex subagents)
+    models: set[str] = field(default_factory=set)
+    per_model: dict[str, Usage] = field(default_factory=dict)
+
+    def usage_for(self, model: str) -> Usage:
+        return self.per_model.setdefault(model, Usage())
+
+    @property
+    def label(self) -> str:
+        """Human-facing name: ``type: description`` where both are known."""
+        desc = self.description.strip()
+        if self.agent_type and desc:
+            return f"{self.agent_type}: {desc}"
+        return self.agent_type or desc or "(subagent)"
+
+    @property
+    def usage(self) -> Usage:
+        return sum_usage(self.per_model)
+
+    @property
+    def cost(self) -> float:
+        return cost_of(self.per_model)
+
+    @property
+    def primary_model(self) -> str:
+        return primary_model_of(self.per_model, self.models)
+
+
 @dataclass
 class Session:
     name: str
@@ -141,19 +245,25 @@ class Session:
     tool: str = "claude"  # which agent produced it: "claude" or "codex"
     gui: bool = False  # opened in the desktop GUI (has claude-code-sessions metadata)
     timestamp: str = ""  # ISO 8601 of the last activity seen (for the Date column)
+    effort: str = ""  # reasoning effort, if the tool records one (Codex only)
+    # Codex subagent linkage, from the rollout's session_meta (empty otherwise);
+    # used to fold a subagent rollout into its parent, then discarded.
+    parent_id: str = ""
+    agent_name: str = ""
+    agent_role: str = ""
     models: set[str] = field(default_factory=set)
     # usage accumulated per model so each slice is priced at its own rate
     per_model: dict[str, Usage] = field(default_factory=dict)
+    # subagents spawned within this session, each with its own model/usage
+    subagents: list[SubAgent] = field(default_factory=list)
 
     def usage_for(self, model: str) -> Usage:
         return self.per_model.setdefault(model, Usage())
 
     @property
     def primary_model(self) -> str:
-        """The model that produced the most tokens (used for display/pricing)."""
-        if self.per_model:
-            return max(self.per_model.items(), key=lambda kv: kv[1].total_tokens)[0]
-        return next(iter(sorted(self.models)), "<unknown>")
+        """The base conversation's dominant model (used for display/pricing)."""
+        return primary_model_of(self.per_model, self.models)
 
     @property
     def date(self) -> str:
@@ -162,28 +272,32 @@ class Session:
 
     @property
     def usage(self) -> Usage:
-        total = Usage()
-        for u in self.per_model.values():
-            total.add(u)
-        return total
+        """Base-conversation usage only (excludes subagents)."""
+        return sum_usage(self.per_model)
 
     @property
     def cost(self) -> float:
-        total = 0.0
-        for model, u in self.per_model.items():
-            rates = price_for(model)
-            if rates is None:
-                _UNKNOWN_MODELS.add(model)
-                continue
-            in_rate, out_rate = rates
-            total += (u.input / 1e6) * in_rate
-            total += (u.output / 1e6) * out_rate
-            total += (u.cache_read / 1e6) * in_rate * CACHE_READ_MULT
-            total += (u.cache_write_5m / 1e6) * in_rate * CACHE_WRITE_5M_MULT
-            total += (u.cache_write_1h / 1e6) * in_rate * CACHE_WRITE_1H_MULT
-            # Unbroken-down cache creation: price at the 5-min rate (the common case).
-            total += (u.cache_write_other / 1e6) * in_rate * CACHE_WRITE_5M_MULT
+        """Base-conversation cost only (excludes subagents)."""
+        return cost_of(self.per_model)
+
+    # --- whole-conversation rollups (base + every subagent) ---
+    @property
+    def all_models(self) -> set[str]:
+        models = set(self.models)
+        for sa in self.subagents:
+            models |= sa.models
+        return models
+
+    @property
+    def total_usage(self) -> Usage:
+        total = sum_usage(self.per_model)
+        for sa in self.subagents:
+            total.add(sa.usage)
         return total
+
+    @property
+    def total_cost(self) -> float:
+        return cost_of(self.per_model) + sum(sa.cost for sa in self.subagents)
 
 
 def parse_session(path: Path) -> Session | None:
@@ -243,31 +357,94 @@ def parse_session(path: Path) -> Session | None:
 
             model = msg.get("model") or "<unknown>"
             session.models.add(model)
-            u = session.usage_for(model)
-
-            u.input += int(usage.get("input_tokens") or 0)
-            u.output += int(usage.get("output_tokens") or 0)
-            u.cache_read += int(usage.get("cache_read_input_tokens") or 0)
-
-            created = int(usage.get("cache_creation_input_tokens") or 0)
-            breakdown = usage.get("cache_creation") or {}
-            wrote_1h = int(breakdown.get("ephemeral_1h_input_tokens") or 0)
-            wrote_5m = int(breakdown.get("ephemeral_5m_input_tokens") or 0)
-            if wrote_1h or wrote_5m:
-                u.cache_write_1h += wrote_1h
-                u.cache_write_5m += wrote_5m
-                # Any remainder the breakdown didn't account for.
-                u.cache_write_other += max(0, created - wrote_1h - wrote_5m)
-            else:
-                u.cache_write_other += created
-
+            _accumulate(usage, session.usage_for(model))
             saw_usage = True
 
-    if not saw_usage:
+    # Subagents live in a sibling directory named after the session id.
+    session.subagents = parse_subagents(path.parent / path.stem / "subagents")
+    for sa in session.subagents:
+        if sa.timestamp > session.timestamp:
+            session.timestamp = sa.timestamp
+
+    if not saw_usage and not session.subagents:
         return None
 
     session.name = name or "(untitled)"
     return session
+
+
+def parse_subagents(subagents_dir: Path) -> list[SubAgent]:
+    """Parse every ``agent-*.jsonl`` under a session's ``subagents/`` dir."""
+    if not subagents_dir.is_dir():
+        return []
+    result: list[SubAgent] = []
+    for jsonl in sorted(subagents_dir.glob("agent-*.jsonl")):
+        sa = parse_subagent(jsonl)
+        if sa is not None:
+            result.append(sa)
+    # Default to spawn order (the glob is by opaque agent-id, not time).
+    result.sort(key=lambda sa: sa.timestamp)
+    return result
+
+
+def parse_subagent(path: Path) -> SubAgent | None:
+    """Parse one subagent transcript (+ its .meta.json), or None if empty.
+
+    The transcript records mirror the base session's assistant turns, so usage
+    is summed per model and deduplicated by API message id the same way.
+    """
+    agent_type = ""
+    description = ""
+    try:
+        meta = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        agent_type = meta.get("agentType") or ""
+        description = meta.get("description") or ""
+    except (OSError, json.JSONDecodeError):
+        pass  # a missing/garbled sidecar just means an unnamed subagent
+
+    sa = SubAgent(agent_type=agent_type, description=description)
+    seen_message_ids: set[str] = set()
+    saw_usage = False
+
+    try:
+        fh = path.open(encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: cannot open {path}: {exc}", file=sys.stderr)
+        return None
+
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            ts = rec.get("timestamp")
+            if ts and ts > sa.timestamp:
+                sa.timestamp = ts
+
+            if rec.get("type") != "assistant":
+                continue
+            msg = rec.get("message") or {}
+            usage = msg.get("usage")
+            if not usage:
+                continue
+
+            mid = msg.get("id")
+            if mid:
+                if mid in seen_message_ids:
+                    continue
+                seen_message_ids.add(mid)
+
+            model = msg.get("model") or "<unknown>"
+            sa.models.add(model)
+            _accumulate(usage, sa.usage_for(model))
+            saw_usage = True
+
+    return sa if saw_usage else None
 
 
 def default_gui_dir() -> Path:
@@ -409,9 +586,13 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     session_id = path.stem
     cwd = ""
     originator = ""
+    parent_id = ""
+    agent_name = ""
+    agent_role = ""
     models: list[str] = []
     user_texts: list[str] = []
     timestamp = ""
+    effort = ""  # reasoning_effort from the latest turn_context that records one
     # token_count.total_token_usage is cumulative; keep the largest seen.
     best_total = 0
     best_usage: dict | None = None
@@ -443,10 +624,21 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 session_id = payload.get("id") or session_id
                 cwd = payload.get("cwd") or ""
                 originator = payload.get("originator") or ""
+                # A subagent rollout links back to its parent thread and carries
+                # a nickname/role; base sessions leave these empty.
+                parent_id = payload.get("parent_thread_id") or ""
+                agent_name = payload.get("agent_nickname") or ""
+                agent_role = payload.get("agent_role") or ""
             elif rtype == "turn_context":
                 m = payload.get("model")
                 if m:
                     models.append(m)
+                # reasoning_effort lives under collaboration_mode.settings and
+                # may be null on older sessions; keep the last non-null value.
+                settings = (payload.get("collaboration_mode") or {}).get("settings") or {}
+                e = settings.get("reasoning_effort")
+                if e:
+                    effort = e
             elif rtype == "event_msg" and payload.get("type") == "token_count":
                 info = payload.get("info") or {}
                 tot = info.get("total_token_usage") or {}
@@ -480,6 +672,10 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         tool="codex",
         gui="desktop" in originator.lower(),
         timestamp=timestamp,
+        effort=effort,
+        parent_id=parent_id,
+        agent_name=agent_name,
+        agent_role=agent_role,
         models=set(models) or {model},
     )
     u = session.usage_for(model)
@@ -489,20 +685,117 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     return session
 
 
+def _codex_subagent(s: Session) -> SubAgent:
+    """Convert a parsed subagent rollout into a SubAgent for its parent.
+
+    The subagent's nickname is its display name; a non-default role becomes the
+    ``type:`` prefix (so the label renders like "reviewer: Aristotle").
+    """
+    role = s.agent_role if s.agent_role.lower() not in ("", "default") else ""
+    return SubAgent(
+        agent_type=role,
+        description=s.agent_name,
+        timestamp=s.timestamp,
+        effort=s.effort,
+        models=set(s.models),
+        per_model=dict(s.per_model),
+    )
+
+
 def find_codex_sessions(codex_root: Path) -> list[Session]:
     if not codex_root.is_dir():
         return []
     index = load_codex_index(codex_root)
-    sessions: list[Session] = []
+    parsed: list[Session] = []
     for path in sorted(codex_root.glob("**/rollout-*.jsonl")):
         s = parse_codex_rollout(path, index)
         if s is not None:
-            sessions.append(s)
-    return sessions
+            parsed.append(s)
+
+    # Fold subagent rollouts into their parent thread. A subagent whose parent
+    # wasn't found (filtered out, or missing) stays a top-level row rather than
+    # vanishing.
+    by_id = {s.session_id: s for s in parsed}
+    tops: list[Session] = []
+    for s in parsed:
+        parent = by_id.get(s.parent_id) if s.parent_id else None
+        if parent is not None and parent is not s:
+            parent.subagents.append(_codex_subagent(s))
+            if s.timestamp > parent.timestamp:
+                parent.timestamp = s.timestamp
+        else:
+            tops.append(s)
+    for s in tops:
+        s.subagents.sort(key=lambda sa: sa.timestamp)
+    return tops
 
 
 def _fmt_int(n: int) -> str:
     return f"{n:,}"
+
+
+def _usage_json(u: Usage, cost: float) -> dict:
+    """Serialize a usage bucket + its cost to the JSON field shape."""
+    return {
+        "input_tokens": u.input,
+        "output_tokens": u.output,
+        "cache_read_tokens": u.cache_read,
+        "cache_write_tokens": (
+            u.cache_write_5m + u.cache_write_1h + u.cache_write_other
+        ),
+        "total_tokens": u.total_tokens,
+        "cost_usd": round(cost, 4),
+    }
+
+
+def _indent(label: str) -> str:
+    """Indent (and truncate) a child row's label under its rollup line."""
+    return _truncate("    " + label, 42)
+
+
+def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
+    """Format the Model column: short id, ``+`` if mixed, ``(effort)`` if any."""
+    cell = short_model(primary_model) + ("+" if len(models) > 1 else "")
+    if effort:
+        cell += f" ({effort})"
+    return cell
+
+
+def _usage_cells(
+    label: str, model: str, src: str, date: str, u: Usage, cost: float
+) -> list[str]:
+    """Build one table row from a usage bucket (shared by session/child rows)."""
+    # Combine all cache-write buckets into one displayed column.
+    cache_write = u.cache_write_5m + u.cache_write_1h + u.cache_write_other
+    return [
+        label,
+        model,
+        src,
+        date,
+        _fmt_int(u.input),
+        _fmt_int(u.output),
+        _fmt_int(u.cache_read),
+        _fmt_int(cache_write),
+        _fmt_int(u.total_tokens),
+        f"${cost:,.2f}",
+    ]
+
+
+def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
+    """Order a session's subagents by the same key as the top-level table.
+
+    ``main`` is emitted separately and always pinned first, so this only orders
+    the subagents among themselves. Unknown keys keep the spawn-time default.
+    """
+    if sort_key == "cost":
+        return sorted(subagents, key=lambda sa: sa.cost, reverse=True)
+    if sort_key == "tokens":
+        return sorted(subagents, key=lambda sa: sa.usage.total_tokens, reverse=True)
+    if sort_key == "name":
+        return sorted(subagents, key=lambda sa: sa.label.lower())
+    if sort_key == "date":
+        return sorted(subagents, key=lambda sa: sa.timestamp, reverse=True)
+    return subagents
 
 
 def print_table(sessions: list[Session], sort_key: str) -> None:
@@ -511,9 +804,11 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         return
 
     if sort_key == "cost":
-        sessions = sorted(sessions, key=lambda s: s.cost, reverse=True)
+        sessions = sorted(sessions, key=lambda s: s.total_cost, reverse=True)
     elif sort_key == "tokens":
-        sessions = sorted(sessions, key=lambda s: s.usage.total_tokens, reverse=True)
+        sessions = sorted(
+            sessions, key=lambda s: s.total_usage.total_tokens, reverse=True
+        )
     elif sort_key == "name":
         sessions = sorted(sessions, key=lambda s: s.name.lower())
     elif sort_key == "date":
@@ -523,27 +818,48 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
     grand = Usage()
     grand_cost = 0.0
     for s in sessions:
-        u = s.usage
-        grand.add(u)
-        grand_cost += s.cost
-        # Combine all cache-write buckets into one displayed column.
-        cache_write = u.cache_write_5m + u.cache_write_1h + u.cache_write_other
-        # A "+" marks a session that mixed models (priced by the dominant one).
-        model = short_model(s.primary_model) + ("+" if len(s.models) > 1 else "")
+        grand.add(s.total_usage)
+        grand_cost += s.total_cost
+
+        if not s.subagents:
+            # Common case: one flat row for the whole (base-only) conversation.
+            # A "+" marks a session that mixed models (priced by the dominant one);
+            # a trailing "(effort)" shows the reasoning effort when recorded.
+            rows.append(
+                _usage_cells(
+                    _truncate(s.name, 42),
+                    _model_cell(s.primary_model, s.models, s.effort),
+                    "gui" if s.gui else "cli",
+                    s.date or "-", s.usage, s.cost,
+                )
+            )
+            continue
+
+        # A conversation with subagents: a rollup line for the whole thing,
+        # then the base and each subagent indented beneath it. The rollup shows
+        # a model only when the whole conversation ran on a single one.
+        models = s.all_models
+        sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
         rows.append(
-            [
-                _truncate(s.name, 42),
-                model,
-                "gui" if s.gui else "cli",
-                s.date or "-",
-                _fmt_int(u.input),
-                _fmt_int(u.output),
-                _fmt_int(u.cache_read),
-                _fmt_int(cache_write),
-                _fmt_int(u.total_tokens),
-                f"${s.cost:,.2f}",
-            ]
+            _usage_cells(
+                _truncate(s.name, 42), sum_model, "gui" if s.gui else "cli",
+                s.date or "-", s.total_usage, s.total_cost,
+            )
         )
+        rows.append(
+            _usage_cells(
+                _indent("main"), _model_cell(s.primary_model, s.models, s.effort),
+                "", "", s.usage, s.cost,
+            )
+        )
+        for sa in _sort_subagents(s.subagents, sort_key):
+            rows.append(
+                _usage_cells(
+                    _indent(sa.label),
+                    _model_cell(sa.primary_model, sa.models, sa.effort),
+                    "", "", sa.usage, sa.cost,
+                )
+            )
 
     headers = ["Session", "Model", "Src", "Date", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
@@ -696,7 +1012,10 @@ def main(argv: list[str] | None = None) -> int:
         "--sort",
         choices=["cost", "tokens", "name", "date"],
         default="cost",
-        help="sort order for the table (default: cost)",
+        help=(
+            "sort order for the table (default: cost); also orders subagents "
+            "within a conversation, with 'main' always pinned first"
+        ),
     )
     parser.add_argument(
         "--since",
@@ -759,28 +1078,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         out = []
         for s in sessions:
-            u = s.usage
-            out.append(
-                {
-                    "name": s.name,
-                    "session_id": s.session_id,
-                    "project": s.project,
-                    "tool": s.tool,
-                    "source": "gui" if s.gui else "cli",
-                    "date": s.date,
-                    "timestamp": s.timestamp,
-                    "primary_model": s.primary_model,
-                    "models": sorted(s.models),
-                    "input_tokens": u.input,
-                    "output_tokens": u.output,
-                    "cache_read_tokens": u.cache_read,
-                    "cache_write_tokens": (
-                        u.cache_write_5m + u.cache_write_1h + u.cache_write_other
-                    ),
-                    "total_tokens": u.total_tokens,
-                    "cost_usd": round(s.cost, 4),
-                }
-            )
+            entry = {
+                "name": s.name,
+                "session_id": s.session_id,
+                "project": s.project,
+                "tool": s.tool,
+                "source": "gui" if s.gui else "cli",
+                "date": s.date,
+                "timestamp": s.timestamp,
+                "primary_model": s.primary_model,
+                "models": sorted(s.all_models),
+                "effort": s.effort or None,
+                # Top-level numbers are the whole conversation (base + subagents).
+                **_usage_json(s.total_usage, s.total_cost),
+                # Broken out so callers can attribute cost to base vs subagents.
+                "base": _usage_json(s.usage, s.cost),
+                "subagents": [
+                    {
+                        "agent_type": sa.agent_type,
+                        "description": sa.description,
+                        "primary_model": sa.primary_model,
+                        "models": sorted(sa.models),
+                        "effort": sa.effort or None,
+                        **_usage_json(sa.usage, sa.cost),
+                    }
+                    for sa in s.subagents
+                ],
+            }
+            out.append(entry)
         json.dump(out, sys.stdout, indent=2)
         sys.stdout.write("\n")
         if _UNKNOWN_MODELS:
