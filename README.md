@@ -81,9 +81,9 @@ Session                                   Model      Src  Date        Input  Out
 ----------------------------------------  ---------  ---  ----------  -----  ------  --------  --------  -----  ------
 Memory allocator for wgpu-hal                        gui  2026-07-02  21.2K  67.0K      9.0M    427.9K   9.5M  $10.86
 ├─ main                                   fable-5                      5.9K  25.6K    367.2K     77.8K  476.5K   $3.26
-├─ Explore: Research VMA algorithms       opus-4.8                     5.1K  16.3K      3.2M    124.8K   3.4M   $2.82
-├─ Explore: Research wgpu allocator ...   opus-4.8                     5.2K  11.1K      3.3M    113.2K   3.4M   $2.65
-└─ Explore: Research D3D12MA algorithms   opus-4.8                     5.0K  13.9K      2.1M    112.0K   2.2M   $2.12
+├─ Research VMA algorithms                opus-4.8                     5.1K  16.3K      3.2M    124.8K   3.4M   $2.82
+├─ Research wgpu allocator status quo     opus-4.8                     5.2K  11.1K      3.3M    113.2K   3.4M   $2.65
+└─ Research D3D12MA algorithms            opus-4.8                     5.0K  13.9K      2.1M    112.0K   2.2M   $2.12
 ```
 
 The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`└─`,
@@ -93,11 +93,12 @@ it scannable at a glance: the rollup line is **bold**, `main` is **cyan**, and
 the subagents are **dimmed**; flat single-session rows keep the default color.
 The per-cell Cost tint and dimmed zeros described above apply to these rows too.
 
-Claude subagents are labelled `type: description` from their `.meta.json`
-sidecar; Codex subagents are labelled by their `agent_nickname` (an unnamed one,
-like an automatic `codex-auto-review` pass, shows as `(subagent)`). Sessions
-with no subagents stay as a single flat row. The **TOTAL** row and all sorting
-use each conversation's rollup (base + subagents) figure.
+Claude subagents are labelled by their `description` from the `.meta.json`
+sidecar (falling back to the agent `type`, e.g. `Explore`, when none was
+recorded); Codex subagents are labelled by their `agent_nickname` (an unnamed
+one, like an automatic `codex-auto-review` pass, shows as `(subagent)`).
+Sessions with no subagents stay as a single flat row. The **TOTAL** row and all
+sorting use each conversation's rollup (base + subagents) figure.
 
 `--sort` applies within a conversation too: the subagents are ordered by the
 same key (e.g. by cost under `--sort cost`), with `main` always pinned directly

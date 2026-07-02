@@ -217,11 +217,10 @@ class SubAgent:
 
     @property
     def label(self) -> str:
-        """Human-facing name: ``type: description`` where both are known."""
+        """Human-facing name: the subagent's description, falling back to its
+        type (e.g. ``Explore``) only when no description was recorded."""
         desc = self.description.strip()
-        if self.agent_type and desc:
-            return f"{self.agent_type}: {desc}"
-        return self.agent_type or desc or "(subagent)"
+        return desc or self.agent_type or "(subagent)"
 
     @property
     def usage(self) -> Usage:
