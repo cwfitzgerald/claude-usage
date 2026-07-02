@@ -245,6 +245,48 @@ class SubAgent:
 
 
 @dataclass
+class Segment:
+    """One *context lifetime* of a base conversation, delimited by a
+    ``compact_boundary``. A session that never compacted has a single segment
+    (not surfaced); each ``/compact`` or auto-compaction starts a new one.
+
+    ``peak_tokens``/``trigger`` come from the boundary that *ended* this segment
+    (its ``preTokens`` and ``manual``/``auto`` trigger); the final, still-live
+    segment has neither. These are context-window occupancy, a different figure
+    from the per-turn billed usage summed into ``per_model``.
+    """
+
+    index: int = 0
+    peak_tokens: int = 0  # preTokens of the terminating boundary; 0 if still live
+    trigger: str = ""     # "manual"/"auto" of that boundary; "" if still live
+    models: set[str] = field(default_factory=set)
+    per_model: dict[str, Usage] = field(default_factory=dict)
+
+    def usage_for(self, model: str) -> Usage:
+        return self.per_model.setdefault(model, Usage())
+
+    @property
+    def label(self) -> str:
+        """``context 2 (→168K)`` for a compacted slice; ``context 3 (live)``
+        for the final one. The arrow marks the peak occupancy it rolled over at."""
+        if self.peak_tokens:
+            return f"context {self.index + 1} (→{_fmt_compact(self.peak_tokens)})"
+        return f"context {self.index + 1} (live)"
+
+    @property
+    def usage(self) -> Usage:
+        return sum_usage(self.per_model)
+
+    @property
+    def cost(self) -> float:
+        return cost_of(self.per_model)
+
+    @property
+    def primary_model(self) -> str:
+        return primary_model_of(self.per_model, self.models)
+
+
+@dataclass
 class Session:
     name: str
     session_id: str
@@ -264,6 +306,9 @@ class Session:
     per_model: dict[str, Usage] = field(default_factory=dict)
     # subagents spawned within this session, each with its own model/usage
     subagents: list[SubAgent] = field(default_factory=list)
+    # context lifetimes split at compaction boundaries; empty unless the base
+    # conversation compacted at least once (i.e. has 2+ non-empty segments)
+    segments: list[Segment] = field(default_factory=list)
 
     def usage_for(self, model: str) -> Usage:
         return self.per_model.setdefault(model, Usage())
@@ -317,6 +362,9 @@ def parse_session(path: Path) -> Session | None:
     session = Session(name="", session_id=session_id, project=project, path=path)
     seen_message_ids: set[str] = set()
     saw_usage = False
+    # Assistant turns are folded into the current context lifetime; a
+    # compact_boundary closes it (stamping its peak/trigger) and opens the next.
+    segments: list[Segment] = [Segment()]
 
     try:
         fh = path.open(encoding="utf-8")
@@ -347,6 +395,16 @@ def parse_session(path: Path) -> Session | None:
             elif rtype == "summary" and not name:
                 name = rec.get("summary") or name
 
+            # A compaction closes the current context lifetime and starts a new
+            # one. Stamp the slice we're leaving with the boundary's occupancy
+            # (preTokens) and trigger, then open the next segment.
+            if rtype == "system" and rec.get("subtype") == "compact_boundary":
+                meta = rec.get("compactMetadata") or {}
+                segments[-1].peak_tokens = int(meta.get("preTokens") or 0)
+                segments[-1].trigger = meta.get("trigger") or ""
+                segments.append(Segment(index=len(segments)))
+                continue
+
             if rtype != "assistant":
                 continue
 
@@ -364,9 +422,27 @@ def parse_session(path: Path) -> Session | None:
                 seen_message_ids.add(mid)
 
             model = msg.get("model") or "<unknown>"
+            # A "<synthetic>" turn is a locally-generated placeholder (e.g.
+            # "No response requested.") with all-zero usage, not a real API
+            # model — skip it so it doesn't register as a spurious extra model.
+            if model == "<synthetic>":
+                continue
             session.models.add(model)
             _accumulate(usage, session.usage_for(model))
+            seg = segments[-1]
+            seg.models.add(model)
+            _accumulate(usage, seg.usage_for(model))
             saw_usage = True
+
+    # Surface the split only when the base actually compacted. Drop empty
+    # slices (e.g. a trailing boundary with no turns after it), then renumber
+    # so labels read context 1..N; a lone remaining segment is just the whole
+    # base and needs no breakdown.
+    non_empty = [s for s in segments if s.usage.total_tokens > 0]
+    if len(non_empty) >= 2:
+        for i, s in enumerate(non_empty):
+            s.index = i
+        session.segments = non_empty
 
     # Subagents live in a sibling directory named after the session id.
     session.subagents = parse_subagents(path.parent / path.stem / "subagents")
@@ -769,28 +845,30 @@ def _usage_json(u: Usage, cost: float) -> dict:
     }
 
 
-def _tree_connectors() -> tuple[str, str]:
-    """Return the (mid, last) child connectors the current stdout can encode.
+def _tree_connectors() -> tuple[str, str, str]:
+    """Return the (mid, last, vert) tree glyphs the current stdout can encode.
 
-    Box-drawing glyphs read best, but a legacy console (e.g. Windows cp1252)
-    can't encode them, so fall back to ASCII rather than crash on write.
+    ``vert`` is the continuation prefix for a deeper level (segments nested
+    under ``main``). Box-drawing glyphs read best, but a legacy console (e.g.
+    Windows cp1252) can't encode them, so fall back to ASCII rather than crash.
     """
     enc = getattr(sys.stdout, "encoding", None) or "ascii"
     try:
-        "├└─".encode(enc)
-        return "├─ ", "└─ "
+        "├└│─".encode(enc)
+        return "├─ ", "└─ ", "│  "
     except (LookupError, UnicodeError):
-        return "|- ", "`- "
+        return "|- ", "`- ", "|  "
 
 
-def _tree_label(label: str, last: bool) -> str:
+def _tree_label(label: str, last: bool, indent: str = "") -> str:
     """Prefix a child row's label with a tree connector, then truncate it.
 
-    The connector keeps the base/subagent grouping visible even when color is
-    off (piped output), and marks the last child of the conversation.
+    The connector keeps the grouping visible even when color is off (piped
+    output), and marks the last child. ``indent`` nests a row one level deeper
+    (e.g. a context segment beneath ``main``).
     """
-    mid, end = _tree_connectors()
-    return _truncate((end if last else mid) + label, 42)
+    mid, end, _ = _tree_connectors()
+    return _truncate(indent + (end if last else mid) + label, 42)
 
 
 def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
@@ -857,6 +935,7 @@ _ROW_PARAMS = {
     "rollup": ["1"],       # bold  — the whole-conversation total
     "main": ["36"],        # cyan  — the base agent
     "sub": ["2"],          # dim   — an indented subagent
+    "seg": ["2", "36"],    # dim cyan — a context lifetime of the base agent
     "total": ["1"],        # bold  — the grand total
 }
 
@@ -948,6 +1027,16 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
     def body_row(kind, cells, cost):
         return (cells, _row_styles(kind, cells, cost))
 
+    def seg_rows(segs, indent):
+        # Context lifetimes always read chronologically (context 1..N), never
+        # reordered by --sort: a later context above an earlier one is nonsense.
+        for j, sg in enumerate(segs):
+            rows.append(body_row("seg", _usage_cells(
+                "", _tree_label(sg.label, last=j == len(segs) - 1, indent=indent),
+                _model_cell(sg.primary_model, sg.models),
+                sg.usage, sg.cost,
+            ), sg.cost))
+
     rows = []
     grand = Usage()
     grand_cost = 0.0
@@ -955,7 +1044,8 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         grand.add(s.total_usage)
         grand_cost += s.total_cost
 
-        if not s.subagents:
+        segs = s.segments  # non-empty only when the base compacted (2+ slices)
+        if not s.subagents and not segs:
             # Common case: one flat row for the whole (base-only) conversation.
             # A "+" marks a session that mixed models (priced by the dominant one);
             # a trailing "(effort)" shows the reasoning effort when recorded.
@@ -967,27 +1057,36 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
             ), s.cost))
             continue
 
-        # A conversation with subagents: a rollup line for the whole thing,
-        # then the base and each subagent indented beneath it. The rollup shows
-        # a model only when the whole conversation ran on a single one.
+        # An expanded conversation (subagents and/or compaction segments): a
+        # rollup line for the whole thing, then its parts indented beneath. The
+        # rollup shows a model only when the whole conversation ran on one.
         models = s.all_models
         sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
         rows.append(body_row("rollup", _usage_cells(
             s.date or "-", _truncate(s.name, 42), sum_model,
             s.total_usage, s.total_cost,
         ), s.total_cost))
-        subs = _sort_subagents(s.subagents, sort_key)
-        rows.append(body_row("main", _usage_cells(
-            "", _tree_label("main", last=not subs),
-            _model_cell(s.primary_model, s.models, s.effort),
-            s.usage, s.cost,
-        ), s.cost))
-        for i, sa in enumerate(subs):
-            rows.append(body_row("sub", _usage_cells(
-                "", _tree_label(sa.label, last=i == len(subs) - 1),
-                _model_cell(sa.primary_model, sa.models, sa.effort),
-                sa.usage, sa.cost,
-            ), sa.cost))
+
+        if s.subagents:
+            # The base is its own "main" row; its context segments (if any) nest
+            # one level deeper, and the subagents follow at the base level.
+            subs = _sort_subagents(s.subagents, sort_key)
+            rows.append(body_row("main", _usage_cells(
+                "", _tree_label("main", last=False),
+                _model_cell(s.primary_model, s.models, s.effort),
+                s.usage, s.cost,
+            ), s.cost))
+            seg_rows(segs, _tree_connectors()[2])
+            for i, sa in enumerate(subs):
+                rows.append(body_row("sub", _usage_cells(
+                    "", _tree_label(sa.label, last=i == len(subs) - 1),
+                    _model_cell(sa.primary_model, sa.models, sa.effort),
+                    sa.usage, sa.cost,
+                ), sa.cost))
+        else:
+            # No subagents: the rollup *is* the base, so its context segments
+            # hang directly off it at the top level.
+            seg_rows(segs, "")
 
     headers = ["Date", "Session", "Model", "Input", "Output", "Cache rd", "Cache wr", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
@@ -1287,6 +1386,20 @@ def main(argv: list[str] | None = None) -> int:
                         **_usage_json(sa.usage, sa.cost),
                     }
                     for sa in s.subagents
+                ],
+                # Base conversation split at compaction boundaries (empty unless
+                # it compacted). peak_tokens/trigger describe the boundary that
+                # ended each slice; these sum to "base", not to the top-level.
+                "segments": [
+                    {
+                        "index": sg.index,
+                        "peak_tokens": sg.peak_tokens or None,
+                        "trigger": sg.trigger or None,
+                        "primary_model": sg.primary_model,
+                        "models": sorted(sg.models),
+                        **_usage_json(sg.usage, sg.cost),
+                    }
+                    for sg in s.segments
                 ],
             }
             out.append(entry)

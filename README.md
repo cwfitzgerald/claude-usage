@@ -111,6 +111,34 @@ under the rollup line. In `--json`, the top-level numbers are the
 whole-conversation rollup, with `base` and a `subagents` array (in spawn order)
 broken out alongside.
 
+### Compaction segments
+
+When a conversation is **compacted** — manually with `/compact` or automatically
+when the context window fills — its usage is split into one row per *context
+lifetime*. Each `context N` slice is the usage billed while that window was
+alive, so the sawtooth is visible: `Cache rd` climbs turn over turn as context
+accumulates, then compaction resets it and the next slice starts cheap.
+
+```
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr     Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
+2026-06-29  Claude session token usage analyzer         opus-4.8             42.6K  136.5K     25.1M    611.6K   $22.27
+            ├─ context 1 (→409.1K)                      opus-4.8              6.7K   68.8K     18.2M    382.0K   $14.67
+            ├─ context 2 (→134.0K)                      opus-4.8             17.5K   56.0K      5.5M    179.0K    $6.01
+            └─ context 3 (live)                         opus-4.8             18.4K   11.7K      1.4M     50.6K    $1.59
+```
+
+The `→168K` on a slice is its **peak context occupancy** — how full the window
+grew (`preTokens`) right before it rolled over; the final `(live)` slice was
+never compacted. That peak is a *different figure* from the token columns, which
+sum per-turn billed usage: a slice's `Cache rd` will dwarf its peak, because
+every turn re-reads the whole window. The slices always read chronologically
+(never reordered by `--sort`), and only appear when a conversation actually
+compacted. When a session has subagents too, its segments nest one level deeper,
+under `main`. In `--json`, a `segments` array (with `peak_tokens` and `trigger`)
+breaks down `base`; only Claude Code records compaction, so Codex sessions have
+none.
+
 ## What it does
 
 - Walks every Claude Code transcript (`<project>/<session-id>.jsonl`) and every
@@ -123,6 +151,8 @@ broken out alongside.
   `<session-id>/subagents/agent-*.jsonl`; Codex writes each as its own top-level
   `rollout-*.jsonl` that links back via `parent_thread_id`, which the tool folds
   into the parent.
+- **Compaction:** splits a Claude conversation at each `compact_boundary` into
+  per-context-lifetime rows, tagged with the peak occupancy it rolled over at.
 - **Codex:** reads the cumulative `total_token_usage` from the session's last
   `token_count` event — no dedup needed.
 - Splits tokens into **input**, **output**, **cache read**, and **cache write**
