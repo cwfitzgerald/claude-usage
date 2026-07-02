@@ -24,6 +24,7 @@ python usage.py --since 7d      # only sessions active in the last 7 days
 python usage.py --since 24h     # ...the last 24 hours (units: h/d/w/mo)
 python usage.py --since 3mo     # ...the last 3 months
 python usage.py --since 2026-06-01  # ...on or after an absolute date
+python usage.py --color always  # force color (default: auto — on for a TTY)
 python usage.py --json          # machine-readable JSON
 python usage.py --projects-dir /path/to/.claude/projects   # Claude transcripts
 python usage.py --codex-dir /path/to/.codex/sessions       # Codex transcripts
@@ -37,14 +38,29 @@ recent Python 3 (3.10+).
 Example:
 
 ```
-Session                                Model     Src  Date           Input   Output    Cache rd   Cache wr       Total    Cost
--------------------------------------  --------  ---  ----------  --------  -------  ----------  ---------  ----------  ------
-PR review helper tool                  opus-4.8  gui  2026-06-15    53,236  190,806  20,270,198    444,956  20,959,196  $19.62
-Sync CLAUDE.md and AGENTS.md           gpt-5.5   gui  2026-06-29   124,629   26,911   1,577,600          0   1,729,140   $2.22
+Session                                Model     Src  Date         Input  Output  Cache rd  Cache wr   Total     Cost
+-------------------------------------  --------  ---  ----------  ------  ------  --------  --------  ------  -------
+PR review helper tool                  opus-4.8  gui  2026-06-15   53.2K  190.8K     20.3M    445.0K   21.0M   $19.62
+Sync CLAUDE.md and AGENTS.md           gpt-5.5   gui  2026-06-29  124.6K   26.9K      1.6M         0    1.7M    $2.22
 ...
--------------------------------------  --------  ---  ----------  --------  -------  ----------  ---------  ----------  ------
-TOTAL (24 sessions: 18 claude, 6 codex)                          973,735  954,089 103,298,005  2,637,466 107,863,295 $106.05
+-------------------------------------  --------  ---  ----------  ------  ------  --------  --------  ------  -------
+TOTAL (24 sessions: 18 claude, 6 codex)                          973.7K  954.1K    103.3M      2.6M  107.9M  $106.05
+Averages  $4.42 per session · $13.26 per active day (8) · $3.53 per calendar day (30d span)
 ```
+
+Below the total is an **Averages** line: cost per session, and two cost-per-day
+rates — over *active* days (distinct dates that actually had a session) and over
+the full *calendar* span (first to last date, idle days included). The first
+answers "what a day I use it costs," the second is a run-rate; they converge as
+you narrow the window with `--since`.
+
+Token counts are abbreviated (`53.2K`, `20.3M`) to keep the columns narrow;
+`--json` reports the exact integers. On a terminal the table is also colorized
+to make it scannable: the **header** is bold, the **Cost** column is tinted by
+size (green under \$5, yellow under \$25, red above — a true \$0.00 is dimmed as
+"no figure"), and always-zero cells (e.g. Codex's Cache wr) are dimmed. Color is
+automatic on a TTY, off when piping, respects `NO_COLOR`, and is forced or
+suppressed with `--color always|never`.
 
 The **Model** column shows the (shortened) model that produced most of the
 session's tokens; a trailing `+` marks a session that used more than one model,
@@ -61,14 +77,21 @@ subagent indented beneath it. The rollup's Model is left blank when the base and
 subagents didn't all run on the same model:
 
 ```
-Session                                   Model      Src  Date          Input   Output   Cache rd  Cache wr      Total    Cost
-----------------------------------------  ---------  ---  ----------  -------  -------  ---------  --------  ---------  ------
-Memory allocator for wgpu-hal                        gui  2026-07-02   21,186   66,973  8,954,027   427,874  9,470,060  $10.86
-    main                                  fable-5                       5,855   25,647    367,222    77,819    476,543   $3.26
-    Explore: Research VMA algorithms      opus-4.8                      5,066   16,311  3,216,492   124,785  3,362,654   $2.82
-    Explore: Research wgpu allocator ...  opus-4.8                      5,219   11,100  3,284,963   113,226  3,414,508   $2.65
-    Explore: Research D3D12MA algorithms  opus-4.8                      5,046   13,915  2,085,350   112,044  2,216,355   $2.12
+Session                                   Model      Src  Date        Input  Output  Cache rd  Cache wr  Total    Cost
+----------------------------------------  ---------  ---  ----------  -----  ------  --------  --------  -----  ------
+Memory allocator for wgpu-hal                        gui  2026-07-02  21.2K  67.0K      9.0M    427.9K   9.5M  $10.86
+├─ main                                   fable-5                      5.9K  25.6K    367.2K     77.8K  476.5K   $3.26
+├─ Explore: Research VMA algorithms       opus-4.8                     5.1K  16.3K      3.2M    124.8K   3.4M   $2.82
+├─ Explore: Research wgpu allocator ...   opus-4.8                     5.2K  11.1K      3.3M    113.2K   3.4M   $2.65
+└─ Explore: Research D3D12MA algorithms   opus-4.8                     5.0K  13.9K      2.1M    112.0K   2.2M   $2.12
 ```
+
+The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`└─`,
+ASCII fallback on legacy consoles) tie each base/subagent row to its rollup and
+mark the last child. **Color** (on a terminal, or with `--color always`) makes
+it scannable at a glance: the rollup line is **bold**, `main` is **cyan**, and
+the subagents are **dimmed**; flat single-session rows keep the default color.
+The per-cell Cost tint and dimmed zeros described above apply to these rows too.
 
 Claude subagents are labelled `type: description` from their `.meta.json`
 sidecar; Codex subagents are labelled by their `agent_nickname` (an unnamed one,

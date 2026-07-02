@@ -734,6 +734,19 @@ def _fmt_int(n: int) -> str:
     return f"{n:,}"
 
 
+def _fmt_compact(n: int) -> str:
+    """Human-readable token count for the table: 142, 45.2K, 34.5M.
+
+    Keeps small counts exact and abbreviates thousands/millions so the wide
+    cache columns stay scannable. JSON output uses the exact integer instead.
+    """
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1_000:.1f}K"
+    return f"{n / 1_000_000:.1f}M"
+
+
 def _usage_json(u: Usage, cost: float) -> dict:
     """Serialize a usage bucket + its cost to the JSON field shape."""
     return {
@@ -748,9 +761,28 @@ def _usage_json(u: Usage, cost: float) -> dict:
     }
 
 
-def _indent(label: str) -> str:
-    """Indent (and truncate) a child row's label under its rollup line."""
-    return _truncate("    " + label, 42)
+def _tree_connectors() -> tuple[str, str]:
+    """Return the (mid, last) child connectors the current stdout can encode.
+
+    Box-drawing glyphs read best, but a legacy console (e.g. Windows cp1252)
+    can't encode them, so fall back to ASCII rather than crash on write.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "├└─".encode(enc)
+        return "├─ ", "└─ "
+    except (LookupError, UnicodeError):
+        return "|- ", "`- "
+
+
+def _tree_label(label: str, last: bool) -> str:
+    """Prefix a child row's label with a tree connector, then truncate it.
+
+    The connector keeps the base/subagent grouping visible even when color is
+    off (piped output), and marks the last child of the conversation.
+    """
+    mid, end = _tree_connectors()
+    return _truncate((end if last else mid) + label, 42)
 
 
 def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
@@ -772,11 +804,11 @@ def _usage_cells(
         model,
         src,
         date,
-        _fmt_int(u.input),
-        _fmt_int(u.output),
-        _fmt_int(u.cache_read),
-        _fmt_int(cache_write),
-        _fmt_int(u.total_tokens),
+        _fmt_compact(u.input),
+        _fmt_compact(u.output),
+        _fmt_compact(u.cache_read),
+        _fmt_compact(cache_write),
+        _fmt_compact(u.total_tokens),
         f"${cost:,.2f}",
     ]
 
@@ -798,7 +830,98 @@ def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
     return subagents
 
 
-def print_table(sessions: list[Session], sort_key: str) -> None:
+# ---------------------------------------------------------------------------
+# Terminal styling
+# ---------------------------------------------------------------------------
+
+_RESET = "\033[0m"
+
+# Column layout, referenced when styling individual cells.
+_COST_COL = 9
+_TOKEN_COLS = (4, 5, 6, 7, 8)  # input, output, cache rd, cache wr, total
+
+# Base SGR parameters per row kind, so the parts of a conversation read at a
+# glance: the bold rollup is the whole-conversation headline, cyan is the base
+# ("main") agent, and the dimmed rows beneath it are its subagents. The header
+# is bold + underlined to sit apart from the body.
+_ROW_PARAMS = {
+    "header": ["1", "4"],  # bold + underline
+    "sep": ["2"],          # dim
+    "flat": [],            # a subagent-free conversation: plain default color
+    "rollup": ["1"],       # bold  — the whole-conversation total
+    "main": ["36"],        # cyan  — the base agent
+    "sub": ["2"],          # dim   — an indented subagent
+    "total": ["1"],        # bold  — the grand total
+}
+
+
+def _sgr(params: list[str]) -> str:
+    """Build an SGR escape from parameters, or "" for no styling."""
+    return f"\033[{';'.join(params)}m" if params else ""
+
+
+def _cost_params(cost: float) -> list[str]:
+    """Traffic-light color for a cost cell: cheap → green, pricey → red.
+
+    A true $0.00 (e.g. an unpriced model) is dimmed rather than colored, so it
+    reads as "no figure" instead of "cheap".
+    """
+    if cost <= 0:
+        return ["2"]          # dim
+    if cost < 5:
+        return ["32"]         # green
+    if cost < 25:
+        return ["33"]         # yellow
+    return ["31"]             # red
+
+
+def _row_styles(kind: str, cells: list[str], cost: float) -> list[str]:
+    """Per-cell SGR codes for a body/total row: kind color, plus a cost tint
+    and dimmed zeros layered on top of it."""
+    base = _ROW_PARAMS[kind]
+    bold_kind = kind in ("rollup", "total")
+    styles = []
+    for i, cell in enumerate(cells):
+        if i == _COST_COL:
+            # Keep the rollup/total bold so the tinted cost still reads as a total.
+            params = _cost_params(cost)
+            styles.append(_sgr(["1"] + params if bold_kind else params))
+        elif i in _TOKEN_COLS and cell == "0":
+            styles.append(_sgr(["2"]))  # dim the always-zero noise (e.g. Codex cache wr)
+        else:
+            styles.append(_sgr(base))
+    return styles
+
+
+def _enable_windows_ansi() -> None:
+    """Turn on ANSI escape processing for the Windows console (no-op elsewhere)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def want_color(mode: str) -> bool:
+    """Resolve --color {auto,always,never} against the environment/TTY."""
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):  # https://no-color.org/
+        return False
+    return sys.stdout.isatty()
+
+
+def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> None:
     if not sessions:
         print("No sessions with token usage found.")
         return
@@ -814,6 +937,11 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
     elif sort_key == "date":
         sessions = sorted(sessions, key=lambda s: s.timestamp, reverse=True)
 
+    # Each row carries its plain cells plus a parallel list of per-cell SGR
+    # codes, so _render can pad on visible width and colorize independently.
+    def body_row(kind, cells, cost):
+        return (cells, _row_styles(kind, cells, cost))
+
     rows = []
     grand = Usage()
     grand_cost = 0.0
@@ -825,14 +953,12 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
             # Common case: one flat row for the whole (base-only) conversation.
             # A "+" marks a session that mixed models (priced by the dominant one);
             # a trailing "(effort)" shows the reasoning effort when recorded.
-            rows.append(
-                _usage_cells(
-                    _truncate(s.name, 42),
-                    _model_cell(s.primary_model, s.models, s.effort),
-                    "gui" if s.gui else "cli",
-                    s.date or "-", s.usage, s.cost,
-                )
-            )
+            rows.append(body_row("flat", _usage_cells(
+                _truncate(s.name, 42),
+                _model_cell(s.primary_model, s.models, s.effort),
+                "gui" if s.gui else "cli",
+                s.date or "-", s.usage, s.cost,
+            ), s.cost))
             continue
 
         # A conversation with subagents: a rollup line for the whole thing,
@@ -840,45 +966,43 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         # a model only when the whole conversation ran on a single one.
         models = s.all_models
         sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
-        rows.append(
-            _usage_cells(
-                _truncate(s.name, 42), sum_model, "gui" if s.gui else "cli",
-                s.date or "-", s.total_usage, s.total_cost,
-            )
-        )
-        rows.append(
-            _usage_cells(
-                _indent("main"), _model_cell(s.primary_model, s.models, s.effort),
-                "", "", s.usage, s.cost,
-            )
-        )
-        for sa in _sort_subagents(s.subagents, sort_key):
-            rows.append(
-                _usage_cells(
-                    _indent(sa.label),
-                    _model_cell(sa.primary_model, sa.models, sa.effort),
-                    "", "", sa.usage, sa.cost,
-                )
-            )
+        rows.append(body_row("rollup", _usage_cells(
+            _truncate(s.name, 42), sum_model, "gui" if s.gui else "cli",
+            s.date or "-", s.total_usage, s.total_cost,
+        ), s.total_cost))
+        subs = _sort_subagents(s.subagents, sort_key)
+        rows.append(body_row("main", _usage_cells(
+            _tree_label("main", last=not subs),
+            _model_cell(s.primary_model, s.models, s.effort),
+            "", "", s.usage, s.cost,
+        ), s.cost))
+        for i, sa in enumerate(subs):
+            rows.append(body_row("sub", _usage_cells(
+                _tree_label(sa.label, last=i == len(subs) - 1),
+                _model_cell(sa.primary_model, sa.models, sa.effort),
+                "", "", sa.usage, sa.cost,
+            ), sa.cost))
 
     headers = ["Session", "Model", "Src", "Date", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
     by_tool = Counter(s.tool for s in sessions)
     breakdown = ", ".join(f"{n} {tool}" for tool, n in sorted(by_tool.items()))
-    total_row = [
+    total_cells = [
         f"TOTAL ({len(sessions)} sessions: {breakdown})",
         "",
         "",
         "",
-        _fmt_int(grand.input),
-        _fmt_int(grand.output),
-        _fmt_int(grand.cache_read),
-        _fmt_int(gw),
-        _fmt_int(grand.total_tokens),
+        _fmt_compact(grand.input),
+        _fmt_compact(grand.output),
+        _fmt_compact(grand.cache_read),
+        _fmt_compact(gw),
+        _fmt_compact(grand.total_tokens),
         f"${grand_cost:,.2f}",
     ]
+    total_row = body_row("total", total_cells, grand_cost)
 
-    _render(headers, rows, total_row)
+    _render(headers, rows, total_row, color)
+    _print_averages(sessions, grand_cost, color)
 
     if _UNKNOWN_MODELS:
         print(
@@ -889,31 +1013,70 @@ def print_table(sessions: list[Session], sort_key: str) -> None:
         )
 
 
+def _print_averages(sessions: list[Session], grand_cost: float, color: bool) -> None:
+    """Print per-session and per-day cost averages beneath the table.
+
+    Two day rates are shown: over *active* days (distinct dates that had a
+    session) and over the full *calendar* span (first to last date, idle days
+    included) — the two answer "cost on a day I use it" vs "run-rate".
+    """
+    n = len(sessions)
+    if not n:
+        return
+    dim = _sgr(["2"]) if color else ""
+    reset = _RESET if color else ""
+
+    parts = [f"${grand_cost / n:,.2f} per session"]
+    dates = sorted(
+        dt.date() for s in sessions if (dt := parse_iso(s.timestamp)) is not None
+    )
+    if dates:
+        active = len(set(dates))
+        span = (dates[-1] - dates[0]).days + 1
+        parts.append(f"${grand_cost / active:,.2f} per active day {dim}({active}){reset}")
+        parts.append(f"${grand_cost / span:,.2f} per calendar day {dim}({span}d span){reset}")
+
+    print(f"{dim}Averages{reset}  " + f" {dim}·{reset} ".join(parts))
+
+
 def _truncate(s: str, width: int) -> str:
     return s if len(s) <= width else s[: width - 3] + "..."
 
 
-def _render(headers: list[str], rows: list[list[str]], total_row: list[str]) -> None:
+def _render(
+    headers: list[str],
+    rows: list[tuple[list[str], list[str]]],
+    total_row: tuple[list[str], list[str]],
+    color: bool = False,
+) -> None:
     cols = len(headers)
     widths = [len(h) for h in headers]
-    for row in rows + [total_row]:
+    for cells, _ in [*rows, total_row]:
         for i in range(cols):
-            widths[i] = max(widths[i], len(row[i]))
+            widths[i] = max(widths[i], len(cells[i]))
 
-    def fmt(row: list[str]) -> str:
-        cells = []
-        for i, cell in enumerate(row):
+    def fmt(cells: list[str], styles: list[str]) -> str:
+        out = []
+        for i, cell in enumerate(cells):
             # Left-align the name/model/source/date columns, right-align numbers.
-            cells.append(cell.ljust(widths[i]) if i <= 3 else cell.rjust(widths[i]))
-        return "  ".join(cells)
+            padded = cell.ljust(widths[i]) if i <= 3 else cell.rjust(widths[i])
+            # Pad first, then wrap in the escape, so widths count visible text
+            # only and each cell is colored independently of its neighbours.
+            code = styles[i] if color else ""
+            out.append(f"{code}{padded}{_RESET}" if code else padded)
+        return "  ".join(out)
 
-    sep = "  ".join("-" * w for w in widths)
-    print(fmt(headers))
-    print(sep)
-    for row in rows:
-        print(fmt(row))
-    print(sep)
-    print(fmt(total_row))
+    header_style = _sgr(_ROW_PARAMS["header"]) if color else ""
+    sep_style = _sgr(_ROW_PARAMS["sep"]) if color else ""
+    sep_cells = ["-" * w for w in widths]
+
+    print(fmt(headers, [header_style] * cols))
+    print(fmt(sep_cells, [sep_style] * cols))
+    for cells, styles in rows:
+        print(fmt(cells, styles))
+    print(fmt(sep_cells, [sep_style] * cols))
+    total_cells, total_styles = total_row
+    print(fmt(total_cells, total_styles))
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1148,13 @@ def parse_since(spec: str, now: datetime) -> datetime:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Prefer UTF-8 output so the tree glyphs render on a legacy Windows console;
+    # harmless where stdout is already UTF-8 or can't be reconfigured.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
     default_dir = Path(os.path.expanduser("~")) / ".claude" / "projects"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1024,6 +1194,16 @@ def main(argv: list[str] | None = None) -> int:
             "only include sessions active at or after WHEN: a relative duration "
             "like '7d', '24h', '2w', '3mo' (units h/d/w/mo), or an absolute date "
             "like '2026-06-01'"
+        ),
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "colorize the table to distinguish rollup / main / subagent rows "
+            "(default: auto — on only when writing to a terminal; also honors "
+            "NO_COLOR)"
         ),
     )
     parser.add_argument(
@@ -1115,7 +1295,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    print_table(sessions, args.sort)
+    color = want_color(args.color)
+    if color:
+        _enable_windows_ansi()
+    print_table(sessions, args.sort, color)
     return 0
 
 
