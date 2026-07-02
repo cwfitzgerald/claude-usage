@@ -38,21 +38,22 @@ recent Python 3 (3.10+).
 Example:
 
 ```
-Session                                Model     Src  Date         Input  Output  Cache rd  Cache wr   Total     Cost
--------------------------------------  --------  ---  ----------  ------  ------  --------  --------  ------  -------
-PR review helper tool                  opus-4.8  gui  2026-06-15   53.2K  190.8K     20.3M    445.0K   21.0M   $19.62
-Sync CLAUDE.md and AGENTS.md           gpt-5.5   gui  2026-06-29  124.6K   26.9K      1.6M         0    1.7M    $2.22
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr   Total    Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  ------  ------
+2026-06-30  wgpu PR #8388 review feedback               opus-4.8             17.2K  250.9K     52.3M    391.2K   53.0M  $36.43
+2026-06-30  wgpu wiki documentation migration           opus-4.8             63.0K  287.6K     26.3M    514.7K   27.1M  $25.78
+2026-06-29  Claude session token usage analyzer         opus-4.8             42.6K  136.5K     25.1M    611.6K   25.8M  $22.27
+2026-06-29  DX12/Vulkan swapchain synchronization       opus-4.8             12.4K  163.4K     16.6M    541.1K   17.4M  $17.87
 ...
--------------------------------------  --------  ---  ----------  ------  ------  --------  --------  ------  -------
-TOTAL (24 sessions: 18 claude, 6 codex)                          973.7K  954.1K    103.3M      2.6M  107.9M  $106.05
-Averages  $4.42 per session · $13.26 per active day (8) · $3.53 per calendar day (30d span)
+Averages  $18.61 per session (12: 10 claude, 2 codex) · $55.83 per active day (4) · $55.83 per calendar day (4d span)
 ```
 
-Below the total is an **Averages** line: cost per session, and two cost-per-day
-rates — over *active* days (distinct dates that actually had a session) and over
-the full *calendar* span (first to last date, idle days included). The first
-answers "what a day I use it costs," the second is a run-rate; they converge as
-you narrow the window with `--since`.
+The table sorts by cost (default) and leads with the **Date** of last activity.
+Below it is an **Averages** line: cost per session (with the session count and
+per-tool breakdown), and two cost-per-day rates — over *active* days (distinct
+dates that actually had a session) and over the full *calendar* span (first to
+last date, idle days included). The first answers "what a day I use it costs,"
+the second is a run-rate; they converge as you narrow the window with `--since`.
 
 Token counts are abbreviated (`53.2K`, `20.3M`) to keep the columns narrow;
 `--json` reports the exact integers. On a terminal the table is also colorized
@@ -78,13 +79,13 @@ subagent indented beneath it. The rollup's Model is left blank when the base and
 subagents didn't all run on the same model:
 
 ```
-Session                                   Model      Src  Date        Input  Output  Cache rd  Cache wr  Total    Cost
-----------------------------------------  ---------  ---  ----------  -----  ------  --------  --------  -----  ------
-Memory allocator for wgpu-hal                        gui  2026-07-02  21.2K  67.0K      9.0M    427.9K   9.5M  $10.86
-├─ main                                   fable-5                      5.9K  25.6K    367.2K     77.8K  476.5K   $3.26
-├─ Research VMA algorithms                opus-4.8                     5.1K  16.3K      3.2M    124.8K   3.4M   $2.82
-├─ Research wgpu allocator status quo     opus-4.8                     5.2K  11.1K      3.3M    113.2K   3.4M   $2.65
-└─ Research D3D12MA algorithms            opus-4.8                     5.0K  13.9K      2.1M    112.0K   2.2M   $2.12
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr   Total    Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  ------  ------
+2026-07-02  Memory allocator for wgpu-hal                                    79.9K  175.2K     92.6M      2.0M   94.8M  $70.26
+            ├─ main                                     fable-5               6.4K   65.2K      2.2M    278.3K    2.6M  $11.13
+            ├─ Fix soundness findings in allocator      opus-4.8             17.4K   21.8K     34.6M    273.4K   34.9M  $19.62
+            ├─ Research VMA algorithms                  opus-4.8              5.1K   16.3K      3.2M    124.8K    3.4M   $2.82
+            └─ Re-verify soundness fixes                opus-4.8              5.8K      28    323.9K    108.7K  438.4K   $0.87
 ```
 
 The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`└─`,
@@ -98,8 +99,8 @@ Claude subagents are labelled by their `description` from the `.meta.json`
 sidecar (falling back to the agent `type`, e.g. `Explore`, when none was
 recorded); Codex subagents are labelled by their `agent_nickname` (an unnamed
 one, like an automatic `codex-auto-review` pass, shows as `(subagent)`).
-Sessions with no subagents stay as a single flat row. The **TOTAL** row and all
-sorting use each conversation's rollup (base + subagents) figure.
+Sessions with no subagents stay as a single flat row. Sorting uses each
+conversation's rollup (base + subagents) figure.
 
 `--sort` applies within a conversation too: the subagents are ordered by the
 same key (e.g. by cost under `--sort cost`), with `main` always pinned directly
@@ -167,12 +168,12 @@ desktop app's data dir. The tool checks the known locations:
 
 It uses the first that exists to:
 
-- mark each row `gui` or `cli` in the **Src** column, and
+- tag each session `gui` or `cli` (surfaced as `source` in `--json`), and
 - prefer the app's curated session title.
 
 Point it elsewhere with `--gui-dir`. If no metadata dir exists (CLI-only
-machine), every row is shown as `cli` — which is correct, and the cost totals
-are unaffected.
+machine), every session is treated as `cli` — which is correct, and the cost
+figures are unaffected.
 
 ## Codex sessions
 
@@ -186,8 +187,8 @@ few things differ from Claude:
   the cached prompt tokens, so the tool splits them out: the cached slice goes
   in the **Cache rd** column (priced at the discounted rate), the rest in
   **Input**. `output_tokens` already includes reasoning tokens.
-- **Src column.** Codex records an `originator`; sessions from "Codex Desktop"
-  are marked `gui`, the CLI/TUI as `cli`.
+- **Source tag.** Codex records an `originator`; sessions from "Codex Desktop"
+  are tagged `gui`, the CLI/TUI as `cli` (surfaced as `source` in `--json`).
 - **Naming.** Recent sessions are named from `~/.codex/session_index.jsonl`;
   older ones fall back to their first real user prompt.
 - **Reasoning effort.** Codex records `reasoning_effort` per turn (under

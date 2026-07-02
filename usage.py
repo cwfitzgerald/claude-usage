@@ -802,16 +802,15 @@ def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
 
 
 def _usage_cells(
-    label: str, model: str, src: str, date: str, u: Usage, cost: float
+    date: str, label: str, model: str, u: Usage, cost: float
 ) -> list[str]:
     """Build one table row from a usage bucket (shared by session/child rows)."""
     # Combine all cache-write buckets into one displayed column.
     cache_write = u.cache_write_5m + u.cache_write_1h + u.cache_write_other
     return [
+        date,
         label,
         model,
-        src,
-        date,
         _fmt_compact(u.input),
         _fmt_compact(u.output),
         _fmt_compact(u.cache_read),
@@ -845,8 +844,8 @@ def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
 _RESET = "\033[0m"
 
 # Column layout, referenced when styling individual cells.
-_COST_COL = 9
-_TOKEN_COLS = (4, 5, 6, 7, 8)  # input, output, cache rd, cache wr, total
+_COST_COL = 8
+_TOKEN_COLS = (3, 4, 5, 6, 7)  # input, output, cache rd, cache wr, total
 
 # Base SGR parameters per row kind, so the parts of a conversation read at a
 # glance: the bold rollup is the whole-conversation headline, cyan is the base
@@ -859,7 +858,6 @@ _ROW_PARAMS = {
     "rollup": ["1"],       # bold  — the whole-conversation total
     "main": ["36"],        # cyan  — the base agent
     "sub": ["2"],          # dim   — an indented subagent
-    "total": ["1"],        # bold  — the grand total
 }
 
 
@@ -887,11 +885,11 @@ def _row_styles(kind: str, cells: list[str], cost: float) -> list[str]:
     """Per-cell SGR codes for a body/total row: kind color, plus a cost tint
     and dimmed zeros layered on top of it."""
     base = _ROW_PARAMS[kind]
-    bold_kind = kind in ("rollup", "total")
+    bold_kind = kind == "rollup"
     styles = []
     for i, cell in enumerate(cells):
         if i == _COST_COL:
-            # Keep the rollup/total bold so the tinted cost still reads as a total.
+            # Keep the rollup bold so the tinted cost still reads as a total.
             params = _cost_params(cost)
             styles.append(_sgr(["1"] + params if bold_kind else params))
         elif i in _TOKEN_COLS and cell == "0":
@@ -951,10 +949,8 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         return (cells, _row_styles(kind, cells, cost))
 
     rows = []
-    grand = Usage()
     grand_cost = 0.0
     for s in sessions:
-        grand.add(s.total_usage)
         grand_cost += s.total_cost
 
         if not s.subagents:
@@ -962,10 +958,10 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
             # A "+" marks a session that mixed models (priced by the dominant one);
             # a trailing "(effort)" shows the reasoning effort when recorded.
             rows.append(body_row("flat", _usage_cells(
+                s.date or "-",
                 _truncate(s.name, 42),
                 _model_cell(s.primary_model, s.models, s.effort),
-                "gui" if s.gui else "cli",
-                s.date or "-", s.usage, s.cost,
+                s.usage, s.cost,
             ), s.cost))
             continue
 
@@ -975,41 +971,25 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         models = s.all_models
         sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
         rows.append(body_row("rollup", _usage_cells(
-            _truncate(s.name, 42), sum_model, "gui" if s.gui else "cli",
-            s.date or "-", s.total_usage, s.total_cost,
+            s.date or "-", _truncate(s.name, 42), sum_model,
+            s.total_usage, s.total_cost,
         ), s.total_cost))
         subs = _sort_subagents(s.subagents, sort_key)
         rows.append(body_row("main", _usage_cells(
-            _tree_label("main", last=not subs),
+            "", _tree_label("main", last=not subs),
             _model_cell(s.primary_model, s.models, s.effort),
-            "", "", s.usage, s.cost,
+            s.usage, s.cost,
         ), s.cost))
         for i, sa in enumerate(subs):
             rows.append(body_row("sub", _usage_cells(
-                _tree_label(sa.label, last=i == len(subs) - 1),
+                "", _tree_label(sa.label, last=i == len(subs) - 1),
                 _model_cell(sa.primary_model, sa.models, sa.effort),
-                "", "", sa.usage, sa.cost,
+                sa.usage, sa.cost,
             ), sa.cost))
 
-    headers = ["Session", "Model", "Src", "Date", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
-    gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
-    by_tool = Counter(s.tool for s in sessions)
-    breakdown = ", ".join(f"{n} {tool}" for tool, n in sorted(by_tool.items()))
-    total_cells = [
-        f"TOTAL ({len(sessions)} sessions: {breakdown})",
-        "",
-        "",
-        "",
-        _fmt_compact(grand.input),
-        _fmt_compact(grand.output),
-        _fmt_compact(grand.cache_read),
-        _fmt_compact(gw),
-        _fmt_compact(grand.total_tokens),
-        f"${grand_cost:,.2f}",
-    ]
-    total_row = body_row("total", total_cells, grand_cost)
+    headers = ["Date", "Session", "Model", "Input", "Output", "Cache rd", "Cache wr", "Total", "Cost"]
 
-    _render(headers, rows, total_row, color)
+    _render(headers, rows, color)
     _print_averages(sessions, grand_cost, color)
 
     if _UNKNOWN_MODELS:
@@ -1034,7 +1014,9 @@ def _print_averages(sessions: list[Session], grand_cost: float, color: bool) -> 
     dim = _sgr(["2"]) if color else ""
     reset = _RESET if color else ""
 
-    parts = [f"${grand_cost / n:,.2f} per session"]
+    by_tool = Counter(s.tool for s in sessions)
+    breakdown = ", ".join(f"{c} {tool}" for tool, c in sorted(by_tool.items()))
+    parts = [f"${grand_cost / n:,.2f} per session {dim}({n}: {breakdown}){reset}"]
     dates = sorted(
         dt.date() for s in sessions if (dt := parse_iso(s.timestamp)) is not None
     )
@@ -1054,20 +1036,19 @@ def _truncate(s: str, width: int) -> str:
 def _render(
     headers: list[str],
     rows: list[tuple[list[str], list[str]]],
-    total_row: tuple[list[str], list[str]],
     color: bool = False,
 ) -> None:
     cols = len(headers)
     widths = [len(h) for h in headers]
-    for cells, _ in [*rows, total_row]:
+    for cells, _ in rows:
         for i in range(cols):
             widths[i] = max(widths[i], len(cells[i]))
 
     def fmt(cells: list[str], styles: list[str]) -> str:
         out = []
         for i, cell in enumerate(cells):
-            # Left-align the name/model/source/date columns, right-align numbers.
-            padded = cell.ljust(widths[i]) if i <= 3 else cell.rjust(widths[i])
+            # Left-align the date/name/model columns, right-align numbers.
+            padded = cell.ljust(widths[i]) if i <= 2 else cell.rjust(widths[i])
             # Pad first, then wrap in the escape, so widths count visible text
             # only and each cell is colored independently of its neighbours.
             code = styles[i] if color else ""
@@ -1082,9 +1063,6 @@ def _render(
     print(fmt(sep_cells, [sep_style] * cols))
     for cells, styles in rows:
         print(fmt(cells, styles))
-    print(fmt(sep_cells, [sep_style] * cols))
-    total_cells, total_styles = total_row
-    print(fmt(total_cells, total_styles))
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1237,7 @@ def main(argv: list[str] | None = None) -> int:
         n = len(load_gui_metadata(args.gui_dir))
         print(
             f"note: GUI metadata dir {args.gui_dir} has {n} entries but none "
-            f"matched a scanned transcript - all sessions shown as 'cli'.",
+            f"matched a scanned transcript - all sessions treated as 'cli'.",
             file=sys.stderr,
         )
 
