@@ -78,38 +78,52 @@ unwieldy ids get an explicit short alias (e.g. `codex-auto-review` shows as
 When a session spawns subagents — which often run a *different* model than the
 base conversation — the session is broken out into three kinds of rows: one
 **rollup** line for the whole conversation, then the base (`main`) and each
-subagent indented beneath it. The rollup's Model is left blank when the base and
-subagents didn't all run on the same model:
+subagent indented beneath it. Subagents can themselves spawn subagents, so the
+tree nests to whatever depth the run reached, each agent's children indented
+under it. The rollup's Model is left blank when the base and subagents didn't all
+run on the same model:
 
 ```
 Date        Session                                     Model                Input  Output  Cache rd  Cache wr     Cost
 ----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
-2026-07-02  Memory allocator for wgpu-hal                                    79.9K  175.2K     92.6M      2.0M   $70.26
-            ├─ main                                     fable-5               6.4K   65.2K      2.2M    278.3K   $11.13
-            ├─ Fix soundness findings in allocator      opus-4.8             17.4K   21.8K     34.6M    273.4K   $19.62
-            ├─ Research VMA algorithms                  opus-4.8              5.1K   16.3K      3.2M    124.8K    $2.82
-            └─ Re-verify soundness fixes                opus-4.8              5.8K      28    323.9K    108.7K    $0.87
+2026-07-03  Memory allocator for wgpu-hal                                   350.5K  621.1K    374.2M      8.5M  $295.71
+            ├─ main                                     fable-5              15.1K  282.5K     20.0M    760.2K   $49.48
+            ├─ Chunk C: vulkan allocator port           opus-4.8             23.6K   14.9K     56.0M      1.8M   $39.43
+            │  └─ Map current vulkan gpu-allocator ...  haiku-4.5              138   12.6K      1.5M     67.4K    $0.30
+            ├─ Chunk D: dx12 allocator port             opus-4.8             48.3K   33.5K     18.7M    226.0K   $11.82
+            │  ├─ Explore dx12 integration call sites   haiku-4.5              144    8.7K      2.0M     68.4K    $0.33
+            │  └─ Explore D3D12MA allocation policy     haiku-4.5               95     150    656.8K     53.5K    $0.13
+            └─ Research VMA algorithms                  opus-4.8              5.1K   16.3K      3.2M    124.8K    $2.82
 ```
 
 The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`└─`,
-ASCII fallback on legacy consoles) tie each base/subagent row to its rollup and
-mark the last child. **Color** (on a terminal, or with `--color always`) makes
-it scannable at a glance: the rollup line is **bold**, `main` is **cyan**, and
-the subagents are **dimmed**; flat single-session rows keep the default color.
-The per-cell Cost tint and dimmed zeros described above apply to these rows too.
+with `│` guide lines for deeper nesting; ASCII fallback on legacy consoles) tie
+each row to its parent and mark the last child. **Color** (on a terminal, or with
+`--color always`) makes it scannable at a glance: the rollup line is **bold**,
+`main` is **cyan**, and the subagents are **dimmed**; flat single-session rows
+keep the default color. The per-cell Cost tint and dimmed zeros described above
+apply to these rows too.
 
-Claude subagents are labelled by their `description` from the `.meta.json`
+Each row shows an agent's *own* usage; a subagent's spawned children are separate
+rows below it (just as `main` excludes its subagents), and the top **rollup**
+sums the whole tree — base plus every subagent at every depth.
+
+Claude subagents are linked to their parent by the spawning `tool_use` id
+recorded in the `.meta.json` sidecar (the layout on disk stays flat — a single
+`<session-id>/subagents/` directory — so the tree is reconstructed from that
+lineage, not the filesystem). They're labelled by their `description` from the
 sidecar (falling back to the agent `type`, e.g. `Explore`, when none was
-recorded); Codex subagents are labelled by their `agent_nickname` (an unnamed
-one, like an automatic `codex-auto-review` pass, shows as `(subagent)`).
-Sessions with no subagents stay as a single flat row. The **TOTAL** row and all
-sorting use each conversation's rollup (base + subagents) figure.
+recorded); Codex subagents link via `parent_thread_id` and are labelled by their
+`agent_nickname` (an unnamed one, like an automatic `codex-auto-review` pass,
+shows as `(subagent)`). Sessions with no subagents stay as a single flat row. The
+**TOTAL** row and all sorting use each conversation's rollup (base + subagents)
+figure.
 
-`--sort` applies within a conversation too: the subagents are ordered by the
-same key (e.g. by cost under `--sort cost`), with `main` always pinned directly
-under the rollup line. In `--json`, the top-level numbers are the
-whole-conversation rollup, with `base` and a `subagents` array (in spawn order)
-broken out alongside.
+`--sort` applies within a conversation too: subagents are ordered by the same key
+(e.g. by cost under `--sort cost`) among their siblings at each level, with
+`main` always pinned directly under the rollup line. In `--json`, the top-level
+numbers are the whole-conversation rollup, with `base` and a `subagents` array
+broken out alongside; each subagent carries its own nested `children` array.
 
 ### Compaction segments
 
@@ -147,10 +161,12 @@ none.
   message id so resumed/replayed logs aren't double-counted.
 - **Subagents:** parses each subagent transcript separately (they often run a
   different model), pricing each at its own rate and showing them indented under
-  a whole-conversation rollup line. Claude stores them under
-  `<session-id>/subagents/agent-*.jsonl`; Codex writes each as its own top-level
-  `rollout-*.jsonl` that links back via `parent_thread_id`, which the tool folds
-  into the parent.
+  a whole-conversation rollup line — nested to any depth when a subagent spawns
+  its own. Claude stores them flat under `<session-id>/subagents/agent-*.jsonl`
+  and links each to its parent by the spawning `tool_use` id in the sidecar;
+  Codex writes each as its own top-level `rollout-*.jsonl` that links back via
+  `parent_thread_id`. Either way the tool reconstructs the tree and folds it into
+  the parent.
 - **Compaction:** splits a Claude conversation at each `compact_boundary` into
   per-context-lifetime rows, tagged with the peak occupancy it rolled over at.
 - **Codex:** reads the cumulative `total_token_usage` from the session's last
@@ -250,6 +266,14 @@ input rate:
 | Cache read            | 0.1×                     |
 | Cache write (5-min)   | 1.25×                    |
 | Cache write (1-hour)  | 2.0×                     |
+
+`PRICING` covers the full current Claude line-up — Fable 5, Mythos 5, the Opus
+4.x, Sonnet (5, 4.6, 4.5, 4), and Haiku (4.5, 3.5) families. Sonnet 5 has a dated
+price bump ($2/$10 per MTok through 2026-08-31, then $3/$15); it's priced at the
+higher, going-forward rate. A dated model id like `claude-haiku-4-5-20251001`
+matches its base entry, and a bare family alias with no version (e.g. `opus` or
+`fable`, which the logs sometimes record instead of the resolved id) is priced at
+the latest version of that family.
 
 The same formula covers OpenAI/Codex models: OpenAI's cached-input rate is 10%
 of the input rate (the same 0.1× as cache read), and there's no cache-write

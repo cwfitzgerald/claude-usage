@@ -10,7 +10,9 @@ Supports multiple tools, shown side by side in one table (the **Tool** column):
   Subagents (Task/Agent tool) each get their own transcript under
   ``<session-id>/subagents/agent-*.jsonl`` and often run a different model than
   the base conversation, so they're parsed separately and shown as their own
-  indented rows beneath a whole-conversation rollup line.
+  indented rows beneath a whole-conversation rollup line. A subagent can spawn
+  further subagents; the on-disk layout stays flat, so the tree is rebuilt from
+  each sidecar's spawning ``toolUseId`` and rendered nested to any depth.
 
 * **Codex** stores rollout transcripts under
   ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl``. Each carries periodic
@@ -58,10 +60,14 @@ PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-5": (5.0, 25.0),
     "claude-opus-4-1": (15.0, 75.0),
     "claude-opus-4-0": (15.0, 75.0),
+    # Sonnet 5 has a dated price bump ($2/$10 through 2026-08-31, then $3/$15);
+    # we price it at the higher, going-forward rate.
+    "claude-sonnet-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-sonnet-4-0": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    "claude-haiku-3-5": (0.80, 4.0),
     # OpenAI / Codex. These reuse the same cost formula as the Claude models:
     # OpenAI's cached-input rate is 10% of the input rate (== CACHE_READ_MULT),
     # so codex "cached_input_tokens" map onto our cache_read bucket and price
@@ -81,6 +87,19 @@ PRICING: dict[str, tuple[float, float]] = {
 _UNKNOWN_MODELS: set[str] = set()
 
 
+# Bare family names (no version) show up in the logs when a session records the
+# alias the user selected — e.g. "opus"/"fable" from fast mode — rather than the
+# resolved id. Map each to the latest known version of that family so those turns
+# are priced instead of silently dropped to $0.
+_FAMILY_LATEST = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5",
+    "fable": "claude-fable-5",
+    "mythos": "claude-mythos-5",
+}
+
+
 def price_for(model: str) -> tuple[float, float] | None:
     """Return (input_rate, output_rate) per MTok for a model id, or None."""
     if model in PRICING:
@@ -91,6 +110,8 @@ def price_for(model: str) -> tuple[float, float] | None:
     for known in sorted(PRICING, key=len, reverse=True):
         if model.startswith(known):
             return PRICING[known]
+    if model in _FAMILY_LATEST:
+        return PRICING[_FAMILY_LATEST[model]]
     return None
 
 
@@ -211,18 +232,36 @@ class SubAgent:
 
     Claude Code stores each subagent's transcript under
     ``<session-id>/subagents/agent-*.jsonl`` next to a ``.meta.json`` sidecar
-    holding its ``agentType`` and ``description``.
+    holding its ``agentType``, ``description``, and the ``toolUseId`` of the
+    spawning call. Subagents can themselves spawn subagents; a child is nested
+    under whichever agent *emitted* the ``tool_use`` whose id matches its
+    ``tool_use_id`` (see :func:`nest_subagents`). ``usage``/``cost`` here are the
+    agent's *own* work only — its ``children`` are separate rows/entries.
     """
 
     agent_type: str = ""
     description: str = ""
     timestamp: str = ""
     effort: str = ""  # reasoning effort, if recorded (Codex subagents)
+    agent_id: str = ""  # opaque id from the agent-<id>.jsonl filename
+    tool_use_id: str = ""  # the spawning tool_use's id; links this to its parent
+    spawn_depth: int = 0  # 1 = spawned by the base, 2 = by a depth-1 subagent, ...
+    # tool_use ids this agent emitted (its own Task/Agent spawns), used to find
+    # which subagents are its children.
+    emitted_tool_use_ids: set[str] = field(default_factory=set)
     models: set[str] = field(default_factory=set)
     per_model: dict[str, Usage] = field(default_factory=dict)
+    # subagents this one spawned, nested to arbitrary depth
+    children: list["SubAgent"] = field(default_factory=list)
 
     def usage_for(self, model: str) -> Usage:
         return self.per_model.setdefault(model, Usage())
+
+    def iter_tree(self):
+        """Yield this subagent, then every descendant (depth-first)."""
+        yield self
+        for child in self.children:
+            yield from child.iter_tree()
 
     @property
     def label(self) -> str:
@@ -333,24 +372,32 @@ class Session:
         """Base-conversation cost only (excludes subagents)."""
         return cost_of(self.per_model)
 
-    # --- whole-conversation rollups (base + every subagent) ---
+    @property
+    def all_subagents(self) -> list["SubAgent"]:
+        """Every subagent in the tree, flattened (depth-first), for accounting."""
+        out: list[SubAgent] = []
+        for sa in self.subagents:
+            out.extend(sa.iter_tree())
+        return out
+
+    # --- whole-conversation rollups (base + every subagent, nested or not) ---
     @property
     def all_models(self) -> set[str]:
         models = set(self.models)
-        for sa in self.subagents:
+        for sa in self.all_subagents:
             models |= sa.models
         return models
 
     @property
     def total_usage(self) -> Usage:
         total = sum_usage(self.per_model)
-        for sa in self.subagents:
+        for sa in self.all_subagents:
             total.add(sa.usage)
         return total
 
     @property
     def total_cost(self) -> float:
-        return cost_of(self.per_model) + sum(sa.cost for sa in self.subagents)
+        return cost_of(self.per_model) + sum(sa.cost for sa in self.all_subagents)
 
 
 def parse_session(path: Path) -> Session | None:
@@ -444,13 +491,15 @@ def parse_session(path: Path) -> Session | None:
             s.index = i
         session.segments = non_empty
 
-    # Subagents live in a sibling directory named after the session id.
-    session.subagents = parse_subagents(path.parent / path.stem / "subagents")
-    for sa in session.subagents:
+    # Subagents live in a sibling directory named after the session id. They're
+    # parsed flat, then reorganized into a tree (a subagent may spawn its own).
+    flat_subagents = parse_subagents(path.parent / path.stem / "subagents")
+    for sa in flat_subagents:
         if sa.timestamp > session.timestamp:
             session.timestamp = sa.timestamp
+    session.subagents = nest_subagents(flat_subagents)
 
-    if not saw_usage and not session.subagents:
+    if not saw_usage and not flat_subagents:
         return None
 
     session.name = name or "(untitled)"
@@ -471,6 +520,25 @@ def parse_subagents(subagents_dir: Path) -> list[SubAgent]:
     return result
 
 
+def _collect_tool_use_ids(msg: dict, into: set[str]) -> None:
+    """Add the id of every ``tool_use`` content block in ``msg`` to ``into``.
+
+    A single assistant message is split across one JSONL line per content block
+    (all sharing the message id), so this must run on *every* line — not just the
+    first-seen id — or spawns emitted on later lines would be missed. Only real
+    ``tool_use`` blocks count; text that merely mentions a ``<tool-use-id>`` does
+    not, which is what keeps a child linked to its true parent.
+    """
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            bid = block.get("id")
+            if bid:
+                into.add(bid)
+
+
 def parse_subagent(path: Path) -> SubAgent | None:
     """Parse one subagent transcript (+ its .meta.json), or None if empty.
 
@@ -479,14 +547,28 @@ def parse_subagent(path: Path) -> SubAgent | None:
     """
     agent_type = ""
     description = ""
+    tool_use_id = ""
+    spawn_depth = 0
     try:
         meta = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
         agent_type = meta.get("agentType") or ""
         description = meta.get("description") or ""
+        tool_use_id = meta.get("toolUseId") or ""
+        spawn_depth = int(meta.get("spawnDepth") or 0)
     except (OSError, json.JSONDecodeError):
-        pass  # a missing/garbled sidecar just means an unnamed subagent
+        pass  # a missing/garbled sidecar just means an unnamed, unlinked subagent
 
-    sa = SubAgent(agent_type=agent_type, description=description)
+    agent_id = path.stem
+    if agent_id.startswith("agent-"):
+        agent_id = agent_id[len("agent-"):]
+
+    sa = SubAgent(
+        agent_type=agent_type,
+        description=description,
+        agent_id=agent_id,
+        tool_use_id=tool_use_id,
+        spawn_depth=spawn_depth,
+    )
     seen_message_ids: set[str] = set()
     saw_usage = False
 
@@ -513,6 +595,9 @@ def parse_subagent(path: Path) -> SubAgent | None:
             if rec.get("type") != "assistant":
                 continue
             msg = rec.get("message") or {}
+            # Record spawn calls before the dedup below skips repeat lines.
+            _collect_tool_use_ids(msg, sa.emitted_tool_use_ids)
+
             usage = msg.get("usage")
             if not usage:
                 continue
@@ -529,6 +614,30 @@ def parse_subagent(path: Path) -> SubAgent | None:
             saw_usage = True
 
     return sa if saw_usage else None
+
+
+def nest_subagents(flat: list[SubAgent]) -> list[SubAgent]:
+    """Turn a flat list of subagents into a forest by spawn lineage.
+
+    Each subagent's ``tool_use_id`` is the id of the ``tool_use`` that spawned
+    it. Whichever agent *emitted* that id is its parent; a subagent nests under
+    that parent's ``children``. Anything spawned by the base conversation (or
+    whose parent transcript is missing) stays at the top level. The returned list
+    is the top-level subagents; ``children`` are populated in place.
+    """
+    owner: dict[str, SubAgent] = {}
+    for sa in flat:
+        for tid in sa.emitted_tool_use_ids:
+            owner[tid] = sa
+
+    top: list[SubAgent] = []
+    for sa in flat:
+        parent = owner.get(sa.tool_use_id) if sa.tool_use_id else None
+        if parent is not None and parent is not sa:
+            parent.children.append(sa)
+        else:
+            top.append(sa)
+    return top
 
 
 def default_gui_dir() -> Path:
@@ -796,21 +905,35 @@ def find_codex_sessions(codex_root: Path) -> list[Session]:
         if s is not None:
             parsed.append(s)
 
-    # Fold subagent rollouts into their parent thread. A subagent whose parent
-    # wasn't found (filtered out, or missing) stays a top-level row rather than
-    # vanishing.
+    # Fold subagent rollouts into their parent thread, preserving nesting (a
+    # subagent can spawn its own). A rollout is a subagent when it links to a
+    # parent we actually parsed; convert each such rollout to a SubAgent once,
+    # then wire the forest. A subagent whose parent wasn't found (filtered out,
+    # or missing) stays a top-level row rather than vanishing.
     by_id = {s.session_id: s for s in parsed}
+
+    def is_sub(s: Session) -> bool:
+        return bool(s.parent_id) and s.parent_id in by_id and by_id[s.parent_id] is not s
+
+    sa_of = {s.session_id: _codex_subagent(s) for s in parsed if is_sub(s)}
+
     tops: list[Session] = []
     for s in parsed:
-        parent = by_id.get(s.parent_id) if s.parent_id else None
-        if parent is not None and parent is not s:
-            parent.subagents.append(_codex_subagent(s))
-            if s.timestamp > parent.timestamp:
-                parent.timestamp = s.timestamp
+        sa = sa_of.get(s.session_id)
+        if sa is None:
+            tops.append(s)  # a base thread (or an orphan whose parent is gone)
+            continue
+        parent_sa = sa_of.get(s.parent_id)
+        if parent_sa is not None:
+            parent_sa.children.append(sa)  # nest under a subagent parent
         else:
-            tops.append(s)
+            by_id[s.parent_id].subagents.append(sa)  # attach to a base thread
+
+    # Bubble each subtree's latest activity up to its root for the Date column.
     for s in tops:
-        s.subagents.sort(key=lambda sa: sa.timestamp)
+        for sa in s.all_subagents:
+            if sa.timestamp > s.timestamp:
+                s.timestamp = sa.timestamp
     return tops
 
 
@@ -1027,6 +1150,9 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
     def body_row(kind, cells, cost):
         return (cells, _row_styles(kind, cells, cost))
 
+    _, _, vert = _tree_connectors()
+    blank = " " * len(vert)
+
     def seg_rows(segs, indent):
         # Context lifetimes always read chronologically (context 1..N), never
         # reordered by --sort: a later context above an earlier one is nonsense.
@@ -1036,6 +1162,20 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
                 _model_cell(sg.primary_model, sg.models),
                 sg.usage, sg.cost,
             ), sg.cost))
+
+    def emit_subagent(sa, prefix, last):
+        # One row for this subagent's own usage, then its spawned children nested
+        # a level deeper. The prefix carries the ancestor guide lines so the tree
+        # stays legible at any depth; children follow the same --sort order.
+        rows.append(body_row("sub", _usage_cells(
+            "", _tree_label(sa.label, last=last, indent=prefix),
+            _model_cell(sa.primary_model, sa.models, sa.effort),
+            sa.usage, sa.cost,
+        ), sa.cost))
+        kids = _sort_subagents(sa.children, sort_key)
+        child_prefix = prefix + (blank if last else vert)
+        for i, k in enumerate(kids):
+            emit_subagent(k, child_prefix, i == len(kids) - 1)
 
     rows = []
     grand = Usage()
@@ -1069,20 +1209,17 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
 
         if s.subagents:
             # The base is its own "main" row; its context segments (if any) nest
-            # one level deeper, and the subagents follow at the base level.
+            # one level deeper, and the subagent forest follows at the base level,
+            # each subagent's spawned children nested beneath it.
             subs = _sort_subagents(s.subagents, sort_key)
             rows.append(body_row("main", _usage_cells(
                 "", _tree_label("main", last=False),
                 _model_cell(s.primary_model, s.models, s.effort),
                 s.usage, s.cost,
             ), s.cost))
-            seg_rows(segs, _tree_connectors()[2])
+            seg_rows(segs, vert)
             for i, sa in enumerate(subs):
-                rows.append(body_row("sub", _usage_cells(
-                    "", _tree_label(sa.label, last=i == len(subs) - 1),
-                    _model_cell(sa.primary_model, sa.models, sa.effort),
-                    sa.usage, sa.cost,
-                ), sa.cost))
+                emit_subagent(sa, "", i == len(subs) - 1)
         else:
             # No subagents: the rollup *is* the base, so its context segments
             # hang directly off it at the top level.
@@ -1358,6 +1495,20 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    def _subagent_json(sa: SubAgent) -> dict:
+        # Own usage/cost only; the whole subtree is captured via nested children.
+        return {
+            "agent_type": sa.agent_type,
+            "description": sa.description,
+            "agent_id": sa.agent_id or None,
+            "spawn_depth": sa.spawn_depth or None,
+            "primary_model": sa.primary_model,
+            "models": sorted(sa.models),
+            "effort": sa.effort or None,
+            **_usage_json(sa.usage, sa.cost),
+            "children": [_subagent_json(c) for c in sa.children],
+        }
+
     if args.json:
         out = []
         for s in sessions:
@@ -1376,17 +1527,8 @@ def main(argv: list[str] | None = None) -> int:
                 **_usage_json(s.total_usage, s.total_cost),
                 # Broken out so callers can attribute cost to base vs subagents.
                 "base": _usage_json(s.usage, s.cost),
-                "subagents": [
-                    {
-                        "agent_type": sa.agent_type,
-                        "description": sa.description,
-                        "primary_model": sa.primary_model,
-                        "models": sorted(sa.models),
-                        "effort": sa.effort or None,
-                        **_usage_json(sa.usage, sa.cost),
-                    }
-                    for sa in s.subagents
-                ],
+                # Top-level subagents only; each nests its own spawned children.
+                "subagents": [_subagent_json(sa) for sa in s.subagents],
                 # Base conversation split at compaction boundaries (empty unless
                 # it compacted). peak_tokens/trigger describe the boundary that
                 # ended each slice; these sum to "base", not to the top-level.
