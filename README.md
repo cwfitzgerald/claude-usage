@@ -67,7 +67,8 @@ automatic on a TTY, off when piping, respects `NO_COLOR`, and is forced or
 suppressed with `--color always|never`.
 
 The **Model** column shows the (shortened) model that produced most of the
-session's tokens; a trailing `+` marks a session that used more than one model,
+session's tokens; a trailing `+` marks a session that used more than one model
+(broken out into per-model rows — see [Multi-model agents](#multi-model-agents)),
 and a trailing `(low)` / `(medium)` / `(xhigh)` shows the reasoning effort when
 the transcript records one (Codex only — Claude Code doesn't persist it). A few
 unwieldy ids get an explicit short alias (e.g. `codex-auto-review` shows as
@@ -100,7 +101,8 @@ The three row kinds are distinguished two ways. **Tree connectors** (`├─`/`�
 with `│` guide lines for deeper nesting; ASCII fallback on legacy consoles) tie
 each row to its parent and mark the last child. **Color** (on a terminal, or with
 `--color always`) makes it scannable at a glance: the rollup line is **bold**,
-`main` is **cyan**, and the subagents are **dimmed**; flat single-session rows
+`main` is **cyan**, the subagents are **dimmed**, and per-model breakdown rows
+(when an agent mixed models) are **dim magenta**; flat single-session rows
 keep the default color. The per-cell Cost tint and dimmed zeros described above
 apply to these rows too.
 
@@ -152,6 +154,41 @@ compacted. When a session has subagents too, its segments nest one level deeper,
 under `main`. In `--json`, a `segments` array (with `peak_tokens` and `trigger`)
 breaks down `base`; only Claude Code records compaction, so Codex sessions have
 none.
+
+### Multi-model agents
+
+A single agent usually runs one model start to finish, but not always: a stalled
+subagent that gets resumed can silently continue on the *session's* model rather
+than the tier it was spawned with, and a base conversation can switch models
+mid-run. Cost is **always** computed per model — each turn is priced at the rate
+of the model that produced it — so the totals are correct regardless. But an
+aggregate row can only name one model, hiding the mix, so whenever an agent used
+more than one model its own usage is broken out into one indented row per model,
+each showing that model's tokens and its own cost. The aggregate row itself
+leaves the Model column **blank** — exactly as the whole-conversation rollup does
+— since the rows beneath it carry the models:
+
+```
+Date        Session                                     Model                Input  Output  Cache rd  Cache wr     Cost
+----------  ------------------------------------------  ------------------  ------  ------  --------  --------  -------
+2026-07-09  M0 resource table work                                           51.8K  131.8K    117.9M      2.3M   $87.88
+            ├─ main                                     fable-5              21.6K   81.0K      2.9M    456.0K   $16.25
+            ├─ Implement 0.2 naga front+IR                                    8.9K   19.3K     32.0M    475.4K   $32.21
+            │  ├─ fable-5                               fable-5              1.7K   14.3K     21.3M    271.5K   $25.46
+            │  └─ opus-4.8                              opus-4.8             7.3K    5.0K     10.6M    203.8K    $6.76
+            └─ ...
+```
+
+Here the *Implement 0.2* subagent was spawned on opus, stalled, and resumed on
+fable — so most of its work (and cost) landed on fable, which the per-model rows
+make plain. The breakdown applies to every kind of agent row: the base (`main`),
+any subagent, and a compaction segment that itself spanned models each expand the
+same way, blanking their own Model cell; a single-model agent stays one row. The breakdown rows are styled dim
+magenta to set them apart from subagents (dim) and segments (dim cyan), and are
+ordered by the same `--sort` key among themselves. In `--json`, every `base`,
+subagent, and segment carries a `per_model` array (one entry per model, with that
+slice's tokens and cost); it's always present — a single-element list for a
+single-model agent — and its entries sum to that agent's own figure.
 
 ## What it does
 

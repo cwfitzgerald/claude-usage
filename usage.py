@@ -968,6 +968,19 @@ def _usage_json(u: Usage, cost: float) -> dict:
     }
 
 
+def _per_model_json(per_model: dict[str, Usage]) -> list[dict]:
+    """Break an agent's usage out by model, each slice priced at its own rate.
+
+    Always present (even for a single-model agent, as a one-element list) so a
+    consumer can attribute cost per model without re-deriving the split. The
+    sum of these slices equals the agent's own usage/cost figure.
+    """
+    return [
+        {"model": model, **_usage_json(u, cost_of({model: u}))}
+        for model, u in per_model.items()
+    ]
+
+
 def _tree_connectors() -> tuple[str, str, str]:
     """Return the (mid, last, vert) tree glyphs the current stdout can encode.
 
@@ -1000,6 +1013,23 @@ def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
     if effort:
         cell += f" ({effort})"
     return cell
+
+
+def _agg_model_cell(
+    primary_model: str, models: set[str], per_model: dict[str, Usage], effort: str = ""
+) -> str:
+    """Model cell for an aggregate row (main / subagent / segment).
+
+    When the agent's usage actually splits across >1 model it gets a per-model
+    breakdown beneath it, so the aggregate row leaves the Model column blank —
+    the same way the whole-conversation rollup line does — rather than naming one
+    model with a ``+``. A ``+`` still appears for the Codex case of several models
+    all attributed to one dominant slice (a single ``per_model`` entry, no
+    breakdown), where naming that model is the only signal available.
+    """
+    if len(per_model) > 1:
+        return f"({effort})" if effort else ""
+    return _model_cell(primary_model, models, effort)
 
 
 def _usage_cells(
@@ -1037,6 +1067,22 @@ def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
     return subagents
 
 
+def _sort_per_model(
+    per_model: dict[str, Usage], sort_key: str
+) -> list[tuple[str, Usage]]:
+    """Order an agent's per-model slices for its breakdown rows.
+
+    Models carry no timestamp, so ``date`` falls back to cost (like the default);
+    ``name`` orders by the displayed short id, ``tokens`` by each slice's size.
+    """
+    items = list(per_model.items())
+    if sort_key == "tokens":
+        return sorted(items, key=lambda kv: kv[1].total_tokens, reverse=True)
+    if sort_key == "name":
+        return sorted(items, key=lambda kv: short_model(kv[0]))
+    return sorted(items, key=lambda kv: cost_of({kv[0]: kv[1]}), reverse=True)
+
+
 # ---------------------------------------------------------------------------
 # Terminal styling
 # ---------------------------------------------------------------------------
@@ -1059,6 +1105,7 @@ _ROW_PARAMS = {
     "main": ["36"],        # cyan  — the base agent
     "sub": ["2"],          # dim   — an indented subagent
     "seg": ["2", "36"],    # dim cyan — a context lifetime of the base agent
+    "model": ["2", "35"],  # dim magenta — one model's slice of a mixed agent
     "total": ["1"],        # bold  — the grand total
 }
 
@@ -1153,27 +1200,53 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
     _, _, vert = _tree_connectors()
     blank = " " * len(vert)
 
+    def pm_child_rows(entity, child_prefix, siblings_after=0):
+        # Break a mixed-model agent's *own* usage into one row per model, each
+        # priced at its own rate, so a within-agent model switch (e.g. an opus
+        # agent that stalled and resumed on fable) is visible and auditable
+        # instead of hiding behind the aggregate row's "+". ``siblings_after``
+        # is the count of other children at this level still to be emitted (e.g.
+        # a subagent's nested subagents), so the last-child marker is correct.
+        items = _sort_per_model(entity.per_model, sort_key)
+        for k, (model, u) in enumerate(items):
+            c = cost_of({model: u})
+            last = siblings_after == 0 and k == len(items) - 1
+            rows.append(body_row("model", _usage_cells(
+                "", _tree_label(short_model(model), last=last, indent=child_prefix),
+                short_model(model), u, c,
+            ), c))
+
     def seg_rows(segs, indent):
         # Context lifetimes always read chronologically (context 1..N), never
         # reordered by --sort: a later context above an earlier one is nonsense.
         for j, sg in enumerate(segs):
+            last_seg = j == len(segs) - 1
             rows.append(body_row("seg", _usage_cells(
-                "", _tree_label(sg.label, last=j == len(segs) - 1, indent=indent),
-                _model_cell(sg.primary_model, sg.models),
+                "", _tree_label(sg.label, last=last_seg, indent=indent),
+                _agg_model_cell(sg.primary_model, sg.models, sg.per_model),
                 sg.usage, sg.cost,
             ), sg.cost))
+            # A segment that itself mixed models breaks down one level deeper.
+            if len(sg.per_model) > 1:
+                deeper = indent + (blank if last_seg else vert)
+                pm_child_rows(sg, deeper)
 
     def emit_subagent(sa, prefix, last):
-        # One row for this subagent's own usage, then its spawned children nested
-        # a level deeper. The prefix carries the ancestor guide lines so the tree
-        # stays legible at any depth; children follow the same --sort order.
+        # One row for this subagent's own usage, then its per-model breakdown (if
+        # mixed) and its spawned children nested a level deeper. The prefix carries
+        # the ancestor guide lines so the tree stays legible at any depth; children
+        # follow the same --sort order.
         rows.append(body_row("sub", _usage_cells(
             "", _tree_label(sa.label, last=last, indent=prefix),
-            _model_cell(sa.primary_model, sa.models, sa.effort),
+            _agg_model_cell(sa.primary_model, sa.models, sa.per_model, sa.effort),
             sa.usage, sa.cost,
         ), sa.cost))
         kids = _sort_subagents(sa.children, sort_key)
         child_prefix = prefix + (blank if last else vert)
+        # Per-model rows precede the nested subagents at the same level, so they
+        # count as non-last whenever this agent also spawned children.
+        if len(sa.per_model) > 1:
+            pm_child_rows(sa, child_prefix, siblings_after=len(kids))
         for i, k in enumerate(kids):
             emit_subagent(k, child_prefix, i == len(kids) - 1)
 
@@ -1185,10 +1258,11 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         grand_cost += s.total_cost
 
         segs = s.segments  # non-empty only when the base compacted (2+ slices)
-        if not s.subagents and not segs:
-            # Common case: one flat row for the whole (base-only) conversation.
-            # A "+" marks a session that mixed models (priced by the dominant one);
-            # a trailing "(effort)" shows the reasoning effort when recorded.
+        base_multi = len(s.per_model) > 1  # base itself switched models
+        if not s.subagents and not segs and not base_multi:
+            # Common case: one flat row for the whole (base-only, single-model)
+            # conversation. A trailing "(effort)" shows the reasoning effort when
+            # recorded.
             rows.append(body_row("flat", _usage_cells(
                 s.date or "-",
                 _truncate(s.name, 42),
@@ -1197,9 +1271,10 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
             ), s.cost))
             continue
 
-        # An expanded conversation (subagents and/or compaction segments): a
-        # rollup line for the whole thing, then its parts indented beneath. The
-        # rollup shows a model only when the whole conversation ran on one.
+        # An expanded conversation (subagents, compaction segments, and/or a base
+        # that mixed models): a rollup line for the whole thing, then its parts
+        # indented beneath. The rollup shows a model only when the whole
+        # conversation ran on one.
         models = s.all_models
         sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
         rows.append(body_row("rollup", _usage_cells(
@@ -1208,22 +1283,29 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         ), s.total_cost))
 
         if s.subagents:
-            # The base is its own "main" row; its context segments (if any) nest
-            # one level deeper, and the subagent forest follows at the base level,
-            # each subagent's spawned children nested beneath it.
+            # The base is its own "main" row; beneath it come its context segments
+            # (if any) or — failing that — its own per-model breakdown when it
+            # mixed models. The subagent forest follows at the base level, each
+            # subagent's spawned children nested beneath it.
             subs = _sort_subagents(s.subagents, sort_key)
             rows.append(body_row("main", _usage_cells(
                 "", _tree_label("main", last=False),
-                _model_cell(s.primary_model, s.models, s.effort),
+                _agg_model_cell(s.primary_model, s.models, s.per_model, s.effort),
                 s.usage, s.cost,
             ), s.cost))
-            seg_rows(segs, vert)
+            if segs:
+                seg_rows(segs, vert)
+            elif base_multi:
+                pm_child_rows(s, vert)
             for i, sa in enumerate(subs):
                 emit_subagent(sa, "", i == len(subs) - 1)
-        else:
+        elif segs:
             # No subagents: the rollup *is* the base, so its context segments
-            # hang directly off it at the top level.
+            # (each further split by model if mixed) hang directly off it.
             seg_rows(segs, "")
+        else:
+            # Base-only but mixed models: break the rollup down by model.
+            pm_child_rows(s, "")
 
     headers = ["Date", "Session", "Model", "Input", "Output", "Cache rd", "Cache wr", "Cost"]
     gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
@@ -1506,6 +1588,8 @@ def main(argv: list[str] | None = None) -> int:
             "models": sorted(sa.models),
             "effort": sa.effort or None,
             **_usage_json(sa.usage, sa.cost),
+            # Own usage split by model (mixed only when >1 entry).
+            "per_model": _per_model_json(sa.per_model),
             "children": [_subagent_json(c) for c in sa.children],
         }
 
@@ -1525,8 +1609,13 @@ def main(argv: list[str] | None = None) -> int:
                 "effort": s.effort or None,
                 # Top-level numbers are the whole conversation (base + subagents).
                 **_usage_json(s.total_usage, s.total_cost),
-                # Broken out so callers can attribute cost to base vs subagents.
-                "base": _usage_json(s.usage, s.cost),
+                # Broken out so callers can attribute cost to base vs subagents;
+                # per_model splits the base's own usage by model (each priced at
+                # its own rate), surfacing any within-base model switch.
+                "base": {
+                    **_usage_json(s.usage, s.cost),
+                    "per_model": _per_model_json(s.per_model),
+                },
                 # Top-level subagents only; each nests its own spawned children.
                 "subagents": [_subagent_json(sa) for sa in s.subagents],
                 # Base conversation split at compaction boundaries (empty unless
@@ -1540,6 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
                         "primary_model": sg.primary_model,
                         "models": sorted(sg.models),
                         **_usage_json(sg.usage, sg.cost),
+                        "per_model": _per_model_json(sg.per_model),
                     }
                     for sg in s.segments
                 ],
