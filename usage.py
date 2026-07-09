@@ -86,6 +86,12 @@ PRICING: dict[str, tuple[float, float]] = {
 # we can warn instead of silently treating their cost as zero.
 _UNKNOWN_MODELS: set[str] = set()
 
+# Models whose rollouts are dropped from the report entirely. Codex runs an
+# automatic post-turn review pass as its own thread under the model
+# "codex-auto-review"; it's machine-internal, unpriced, and just noise here, so
+# a rollout resolved to one of these is skipped rather than shown as a $0.00 row.
+_IGNORED_MODELS: set[str] = {"codex-auto-review"}
+
 
 # Bare family names (no version) show up in the logs when a session records the
 # alias the user selected — e.g. "opus"/"fable" from fast mode — rather than the
@@ -115,10 +121,10 @@ def price_for(model: str) -> tuple[float, float] | None:
     return None
 
 
-# Explicit short aliases for model ids too long to display comfortably.
-_MODEL_ALIASES = {
-    "codex-auto-review": "cdx-ar",
-}
+# Explicit short aliases for model ids too long to display comfortably. Empty
+# for now (codex-auto-review, the former sole entry, is dropped upstream via
+# _IGNORED_MODELS), but kept as the hook for any future unwieldy id.
+_MODEL_ALIASES: dict[str, str] = {}
 
 
 def short_model(model: str) -> str:
@@ -852,10 +858,14 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     cached = int(best_usage.get("cached_input_tokens") or 0)
     output = int(best_usage.get("output_tokens") or 0)  # already includes reasoning
 
-    # Pick the model the session mostly ran on for pricing (a session may also
-    # invoke internal models like codex-auto-review; we attribute the aggregate
-    # total to the dominant one).
+    # Pick the model the session mostly ran on for pricing.
     model = max(set(models), key=models.count) if models else "<unknown>"
+
+    # Drop machine-internal passes (e.g. codex-auto-review) outright: they're
+    # unpriced noise, and dropping the rollout here also keeps the model out of
+    # any parent's model set and silences the "no pricing" warning.
+    if model in _IGNORED_MODELS:
+        return None
 
     session = Session(
         name=index.get(session_id) or _codex_fallback_name(user_texts),
