@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-usage"
+version = "0.1.0"
+description = "A local web dashboard for Claude Code and Codex usage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0 OR Zlib"
+dependencies = [
+    "click>=8.2.0",
+    "starlette>=0.47.0",
+    "uvicorn>=0.35.0",
+]
+
+[project.scripts]
+claude-usage = "claude_usage.cli:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.0",
+    "pytest>=8.4.0",
+    "ruff>=0.12.0",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/LICENSE-ZLIB",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_usage"]
+# Static frontend files and templates live below this package and are included
+# in wheels alongside the Python modules.
+include = [
+    "src/claude_usage/static/**",
+    "src/claude_usage/templates/**",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

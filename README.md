@@ -1,39 +1,67 @@
 # claude-usage
 
-A small tool that scans your local coding-agent session transcripts and reports
-token usage and estimated cost per session. It reads **Claude Code** and
-**Codex** sessions and shows them side by side in one table, each row labelled
-with the model that produced it.
+A local web dashboard that scans coding-agent session transcripts and reports
+token usage and estimated cost. It reads **Claude Code** and
+**Codex** sessions, keeps the current result cached in memory, and updates it
+only when requested.
 
 > ### 🤖 This is vibe coded
 >
 > This entire tool — code, docs, and this very sentence — was written by Claude
 > (Claude Code) through conversational prompting, with light human steering. It
 > has **not** been carefully audited line by line. Treat the numbers as a
-> useful approximation, not an invoice. Read [`usage.py`](usage.py) before
+> useful approximation, not an invoice. Read the code under
+> [`src/claude_usage`](src/claude_usage) before
 > trusting it with anything that matters. PRs and fixes welcome.
 
-## Usage
+## Dashboard
 
 ```sh
-python usage.py                 # table, sorted by cost (default)
-python usage.py --sort tokens   # sort by total tokens
-python usage.py --sort name     # sort alphabetically
-python usage.py --sort date     # sort by last-activity date, newest first
-python usage.py --since 7d      # only sessions active in the last 7 days
-python usage.py --since 24h     # ...the last 24 hours (units: h/d/w/mo)
-python usage.py --since 3mo     # ...the last 3 months
-python usage.py --since 2026-06-01  # ...on or after an absolute date
-python usage.py --color always  # force color (default: auto — on for a TTY)
-python usage.py --json          # machine-readable JSON
-python usage.py --projects-dir /path/to/.claude/projects   # Claude transcripts
-python usage.py --codex-dir /path/to/.codex/sessions       # Codex transcripts
+uv sync
+uv run claude-usage
 ```
 
-By default it reads Claude Code transcripts from `~/.claude/projects/*/*.jsonl`
-and Codex transcripts from `~/.codex/sessions/**/rollout-*.jsonl`. Either source
-is optional — missing directories are simply skipped. No dependencies beyond a
-recent Python 3 (3.10+).
+The server opens <http://127.0.0.1:8765> in your default browser automatically
+(`--no-open` disables that for headless use). The initial scan happens in the
+background. The dashboard then serves its cached snapshot until **Update data**
+is pressed; sorting, searching, and filtering never rescan the files. Expanded
+rows show the main agent, nested subagents, model splits, and compaction
+segments. Session and subagent ordering are controlled independently; subagent
+ordering applies recursively to every nested level.
+
+The server binds only to the loopback interface by default because session
+metadata is private and the dashboard has no authentication. Paths can be
+overridden with `--projects-dir`, `--gui-dir`, and `--codex-dir`; the bind can
+be changed with `--host` and `--port`.
+
+### Terminal compatibility
+
+The previous terminal and JSON reports remain available:
+
+```sh
+uv run claude-usage report                 # terminal table
+uv run claude-usage report --sort tokens
+uv run claude-usage report --since 7d
+uv run claude-usage report --json
+
+# Historical option-only invocations also continue to work.
+uv run claude-usage --json
+```
+
+By default the scanner reads Claude Code transcripts from
+`~/.claude/projects/*/*.jsonl` and Codex transcripts from
+`~/.codex/sessions/**/rollout-*.jsonl`. Either source may be absent.
+
+### Context semantics
+
+- **Context used** is the sum of the peak context occupancy reached in each
+  context lifetime. **Peak context** is the largest single lifetime for that
+  agent. A thread's Context value adds its main agent and nested subagents.
+  Claude compaction boundaries provide distinct context lifetimes. Codex
+  records per-request context occupancy and the effective model window, but not
+  explicit compaction boundaries.
+
+## Terminal report reference
 
 Example:
 
@@ -296,7 +324,7 @@ read. If you know where pi persists sessions, a parser would be welcome.
 ## Cost model
 
 Cost is an estimate based on published per-MTok rates (`PRICING` in
-[`usage.py`](usage.py)), with the standard cache multipliers applied to the
+[`src/claude_usage/core.py`](src/claude_usage/core.py)), with the standard cache multipliers applied to the
 input rate:
 
 | Token type            | Multiplier vs input rate |
@@ -313,14 +341,15 @@ matches its base entry, and a bare family alias with no version (e.g. `opus` or
 `fable`, which the logs sometimes record instead of the resolved id) is priced at
 the latest version of that family.
 
-The same formula covers OpenAI/Codex models: OpenAI's cached-input rate is 10%
-of the input rate (the same 0.1× as cache read), and there's no cache-write
-surcharge, so those buckets stay zero. Priced Codex models: `gpt-5.5`,
-`gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.4-pro`
-(standard-tier list prices, USD/MTok, as of 2026-07; the pricier "priority" tier
-isn't modelled). Other Codex models seen in the wild (e.g. a locally-served Qwen)
-have no entry. The internal `codex-auto-review` model is not priced either, but
-rather than warn, its rollouts are dropped upstream (see
+The same formula covers OpenAI/Codex models. OpenAI cached input is 10% of the
+uncached input rate. GPT-5.6 cache writes are 1.25× input if the transcript
+reports them. Priced Codex models include GPT-5.6 Sol, Terra, and Luna (plus the
+unsuffixed Sol alias), GPT-5.5 and GPT-5.5 Pro, and GPT-5.4, mini, nano, and Pro.
+These are standard-tier list prices as of 2026-07; priority processing,
+regional uplifts, Batch/Flex discounts, and long-context surcharges are not
+modelled. Other Codex models seen in the wild (for example, a locally served
+Qwen) have no entry. The internal `codex-auto-review` model is not priced
+either; its rollouts are dropped upstream instead of producing a warning (see
 [Codex sessions](#codex-sessions)).
 
 Models without a pricing entry are reported with `$0.00` and a stderr warning;

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent usage</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <h1>Agent usage</h1>
+      <p>Local token usage and estimated cost</p>
+    </div>
+    <div class="update-block">
+      <button class="primary" id="refresh" type="button">
+        <span aria-hidden="true">↻</span> Update data
+      </button>
+      <span class="cache-status" id="cache-status" role="status" aria-live="polite">
+        <span class="cache-status-primary">Loading cached data…</span>
+      </span>
+    </div>
+  </header>
+
+  <main>
+    <form class="toolbar" id="filters" role="search">
+      <label class="search-field">
+        <span>Search sessions</span>
+        <input id="search" name="q" type="search" placeholder="Session or model" autocomplete="off">
+      </label>
+      <label>
+        <span>Since</span>
+        <select id="since" name="since">
+          <option value="">All time</option>
+          <option value="24h">24 hours</option>
+          <option value="7d">7 days</option>
+          <option value="30d">30 days</option>
+          <option value="3mo">3 months</option>
+        </select>
+      </label>
+      <label>
+        <span>Tool</span>
+        <select id="tool" name="tool">
+          <option value="">All tools</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
+      </label>
+      <label>
+        <span>Sort</span>
+        <select id="sort" name="sort">
+          <option value="cost">Cost</option>
+          <option value="date">Date</option>
+          <option value="name">Name</option>
+          <option value="tokens">Tokens</option>
+          <option value="context">Context used</option>
+        </select>
+      </label>
+      <label>
+        <span>Subagents</span>
+        <select id="subagent-sort" name="subagent_sort">
+          <option value="cost">Cost</option>
+          <option value="tokens">Tokens</option>
+          <option value="name">Name</option>
+          <option value="date">Date</option>
+        </select>
+      </label>
+      <label>
+        <span>Order</span>
+        <select id="order" name="order">
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
+      </label>
+    </form>
+
+    <div class="notice error" id="error" role="alert" hidden></div>
+
+    <section class="table-shell" aria-labelledby="results-heading">
+      <div class="results-heading">
+        <h2 id="results-heading">Sessions</h2>
+        <span id="result-count"></span>
+      </div>
+      <div class="table-scroll" id="table-scroll">
+        <table id="sessions-table">
+          <caption class="sr-only">Coding-agent usage by session. Expand a session for its detailed breakdown.</caption>
+          <thead>
+            <tr class="groups">
+              <th colspan="4" scope="colgroup">Session</th>
+              <th colspan="4" scope="colgroup">Tokens</th>
+              <th scope="colgroup">Estimate</th>
+            </tr>
+            <tr>
+              <th scope="col">Date</th>
+              <th scope="col">Session</th>
+              <th class="number" scope="col"><abbr title="Sum of peak context occupancy across this thread's agents and context lifetimes">Ctx</abbr></th>
+              <th scope="col">Model</th>
+              <th class="number" scope="col"><abbr title="Input tokens">In</abbr></th>
+              <th class="number" scope="col"><abbr title="Output tokens">Out</abbr></th>
+              <th class="number" scope="col"><abbr title="Cache read tokens">Cache R</abbr></th>
+              <th class="number optional" scope="col"><abbr title="Cache write tokens">Cache W</abbr></th>
+              <th class="number" scope="col">Cost</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body">
+            <tr><td class="empty" colspan="9">Loading sessions…</td></tr>
+          </tbody>
+          <tfoot id="sessions-foot" hidden></tfoot>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
