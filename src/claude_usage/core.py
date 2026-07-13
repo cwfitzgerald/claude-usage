@@ -460,7 +460,9 @@ def _finalize_contexts(
 
     entity.context_used_tokens = sum(s.context_tokens for s in segments)
     entity.peak_context_tokens = max((s.context_tokens for s in segments), default=0)
-    visible = segments if keep_empty else [s for s in segments if s.usage.total_tokens > 0]
+    visible = (
+        segments if keep_empty else [s for s in segments if s.usage.total_tokens > 0]
+    )
     if len(visible) >= 2:
         for index, segment in enumerate(visible):
             segment.index = index
@@ -910,6 +912,14 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     peak_context_tokens = 0
     context_window_tokens = 0
     saw_session_meta = False
+    # A forked subagent rollout starts with a verbatim copy of its parent's
+    # history.  Codex marks the end of that replay with the structured
+    # inter-agent trigger for the child's first turn.  Keep the copied
+    # cumulative counter only as the child's billing baseline; none of the
+    # replayed models, occupancy, or compaction boundaries belong to the child.
+    replaying_fork = False
+    fork_baseline_usage: dict | None = None
+    pending_turn_context: dict | None = None
     # Codex keeps billed usage cumulative across compaction. Capture the latest
     # cumulative counter at each boundary, plus the peak occupancy in that
     # context lifetime, then subtract adjacent snapshots after parsing.
@@ -960,6 +970,35 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 )
                 agent_name = _codex_agent_name(payload)
                 agent_role = payload.get("agent_role") or spawn.get("agent_role") or ""
+                replaying_fork = bool(parent_id and payload.get("forked_from_id"))
+            elif replaying_fork:
+                if rtype == "turn_context":
+                    # The child's own turn_context immediately precedes its
+                    # inter-agent trigger, so the last one in the replay is the
+                    # context to retain once the copied prefix ends.
+                    pending_turn_context = payload
+                elif rtype == "event_msg" and payload.get("type") == "token_count":
+                    info = payload.get("info") or {}
+                    total = info.get("total_token_usage") or {}
+                    if int(total.get("total_tokens") or 0) >= int(
+                        (fork_baseline_usage or {}).get("total_tokens") or 0
+                    ):
+                        fork_baseline_usage = dict(total)
+                elif rtype == "inter_agent_communication_metadata" and payload.get(
+                    "trigger_turn"
+                ):
+                    replaying_fork = False
+                    payload = pending_turn_context or {}
+                    m = payload.get("model")
+                    if m:
+                        models.append(m)
+                        segment_models.add(m)
+                    settings = (payload.get("collaboration_mode") or {}).get(
+                        "settings"
+                    ) or {}
+                    e = settings.get("reasoning_effort")
+                    if e:
+                        effort = e
             elif rtype == "turn_context":
                 m = payload.get("model")
                 if m:
@@ -1036,12 +1075,12 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         context_window_tokens=context_window_tokens,
     )
     u = session.usage_for(model)
-    total_usage = _codex_usage_delta(best_usage)
+    total_usage = _codex_usage_delta(best_usage, fork_baseline_usage)
     u.add(total_usage)
 
     if segment_snapshots:
         segment_snapshots.append((dict(best_usage), segment_peak, set(segment_models)))
-        baseline: dict | None = None
+        baseline: dict | None = fork_baseline_usage
         segments: list[Segment] = []
         for snapshot, peak, seen_models in segment_snapshots:
             segment = Segment(

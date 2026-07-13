@@ -272,6 +272,109 @@ def test_codex_compaction_surfaces_before_next_billed_turn(tmp_path: Path) -> No
     assert session.segments[1].context_tokens == 5
 
 
+def test_forked_codex_subagent_excludes_replayed_parent_compaction(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "rollout-forked-child.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-01T11:02:00Z",
+                "payload": {
+                    "id": "child",
+                    "parent_thread_id": "parent",
+                    "forked_from_id": "parent",
+                    "agent_path": "/root/fix_tests",
+                },
+            },
+            # Codex replays the parent's rollout after the child's metadata.
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-01T11:02:01Z",
+                "payload": {"id": "parent"},
+            },
+            {
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.4"},
+            },
+            codex_token_count(
+                "2026-07-01T11:02:02Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=70,
+            ),
+            {"type": "compacted", "payload": {"replacement_history": []}},
+            codex_token_count(
+                "2026-07-01T11:02:03Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=5,
+            ),
+            # The child's first turn_context is written just before the
+            # structured marker that ends the inherited prefix.
+            {
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.4-mini",
+                    "collaboration_mode": {"settings": {"reasoning_effort": "high"}},
+                },
+            },
+            {
+                "type": "inter_agent_communication_metadata",
+                "payload": {"trigger_turn": True},
+            },
+            codex_token_count(
+                "2026-07-01T11:02:04Z",
+                total_tokens=130,
+                input_tokens=105,
+                cached_input_tokens=25,
+                output_tokens=25,
+                last_tokens=20,
+            ),
+            {"type": "compacted", "payload": {"replacement_history": []}},
+            codex_token_count(
+                "2026-07-01T11:02:05Z",
+                total_tokens=130,
+                input_tokens=105,
+                cached_input_tokens=25,
+                output_tokens=25,
+                last_tokens=4,
+            ),
+            codex_token_count(
+                "2026-07-01T11:02:06Z",
+                total_tokens=150,
+                input_tokens=120,
+                cached_input_tokens=30,
+                output_tokens=30,
+                last_tokens=10,
+            ),
+        ],
+    )
+
+    session = parse_codex_rollout(transcript, {})
+
+    assert session is not None
+    assert session.parent_id == "parent"
+    assert session.agent_name == "Fix tests"
+    assert session.primary_model == "gpt-5.4-mini"
+    assert session.effort == "high"
+    assert session.usage == Usage(input=30, cache_read=10, output=10)
+    assert len(session.segments) == 2
+    first, second = session.segments
+    assert first.usage == Usage(input=20, cache_read=5, output=5)
+    assert first.label == "context 1 (→20)"
+    assert second.usage == Usage(input=10, cache_read=5, output=5)
+    assert second.label == "context 2 (live)"
+    assert session.context_used_tokens == 30
+    assert session.peak_context_tokens == 20
+
+
 def test_parse_claude_dedupes_compacts_and_loads_subagent(tmp_path: Path) -> None:
     transcript = tmp_path / "project" / "session-1.jsonl"
     first_turn = claude_assistant(
