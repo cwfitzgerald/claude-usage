@@ -313,13 +313,14 @@ class SubAgent:
 @dataclass
 class Segment:
     """One *context lifetime* of a base conversation, delimited by a
-    ``compact_boundary``. A session that never compacted has a single segment
-    (not surfaced); each ``/compact`` or auto-compaction starts a new one.
+    compaction record. A session that never compacted has a single segment (not
+    surfaced); each manual or automatic compaction starts a new one.
 
-    ``peak_tokens``/``trigger`` come from the boundary that *ended* this segment
-    (its ``preTokens`` and ``manual``/``auto`` trigger); the final, still-live
-    segment has neither. These are context-window occupancy, a different figure
-    from the per-turn billed usage summed into ``per_model``.
+    Claude's ``compact_boundary`` supplies ``preTokens`` and a ``manual``/``auto``
+    trigger. Codex supplies cumulative usage snapshots and per-turn context
+    occupancy around its ``compacted`` record. The final segment has no trigger.
+    These are context-window occupancy, a different figure from the per-turn
+    billed usage summed into ``per_model``.
     """
 
     index: int = 0
@@ -446,8 +447,11 @@ class Session:
         )
 
 
-def _finalize_claude_contexts(
-    entity: Session | SubAgent, segments: list[Segment]
+def _finalize_contexts(
+    entity: Session | SubAgent,
+    segments: list[Segment],
+    *,
+    keep_empty: bool = False,
 ) -> None:
     """Attach aggregate per-context occupancy to a worker."""
 
@@ -456,11 +460,11 @@ def _finalize_claude_contexts(
 
     entity.context_used_tokens = sum(s.context_tokens for s in segments)
     entity.peak_context_tokens = max((s.context_tokens for s in segments), default=0)
-    non_empty = [s for s in segments if s.usage.total_tokens > 0]
-    if len(non_empty) >= 2:
-        for index, segment in enumerate(non_empty):
+    visible = segments if keep_empty else [s for s in segments if s.usage.total_tokens > 0]
+    if len(visible) >= 2:
+        for index, segment in enumerate(visible):
             segment.index = index
-        entity.segments = non_empty
+        entity.segments = visible
 
 
 def parse_session(path: Path) -> Session | None:
@@ -546,7 +550,7 @@ def parse_session(path: Path) -> Session | None:
             )
             saw_usage = True
 
-    _finalize_claude_contexts(session, segments)
+    _finalize_contexts(session, segments)
 
     # Subagents live in a sibling directory named after the session id. They're
     # parsed flat, then reorganized into a tree (a subagent may spawn its own).
@@ -685,7 +689,7 @@ def parse_subagent(path: Path) -> SubAgent | None:
             )
             saw_usage = True
 
-    _finalize_claude_contexts(sa, segments)
+    _finalize_contexts(sa, segments)
     return sa if saw_usage else None
 
 
@@ -848,6 +852,22 @@ def _codex_fallback_name(user_texts: list[str]) -> str:
     return "(untitled)"
 
 
+def _codex_usage_delta(total: dict, baseline: dict | None = None) -> Usage:
+    """Convert two cumulative Codex counters into one billed usage slice."""
+    baseline = baseline or {}
+
+    def delta(key: str) -> int:
+        return max(0, int(total.get(key) or 0) - int(baseline.get(key) or 0))
+
+    input_total = delta("input_tokens")
+    cached = min(delta("cached_input_tokens"), input_total)
+    return Usage(
+        input=input_total - cached,
+        cache_read=cached,
+        output=delta("output_tokens"),
+    )
+
+
 def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     """Parse one Codex rollout transcript, or None if it has no token usage."""
     session_id = path.stem
@@ -866,6 +886,12 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     peak_context_tokens = 0
     context_window_tokens = 0
     saw_session_meta = False
+    # Codex keeps billed usage cumulative across compaction. Capture the latest
+    # cumulative counter at each boundary, plus the peak occupancy in that
+    # context lifetime, then subtract adjacent snapshots after parsing.
+    segment_snapshots: list[tuple[dict, int, set[str]]] = []
+    segment_peak = 0
+    segment_models: set[str] = set()
 
     try:
         fh = path.open(encoding="utf-8")
@@ -909,6 +935,7 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 m = payload.get("model")
                 if m:
                     models.append(m)
+                    segment_models.add(m)
                 # reasoning_effort lives under collaboration_mode.settings and
                 # may be null on older sessions; keep the last non-null value.
                 settings = (payload.get("collaboration_mode") or {}).get(
@@ -924,12 +951,19 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 peak_context_tokens = max(
                     peak_context_tokens, int(last.get("total_tokens") or 0)
                 )
+                segment_peak = max(segment_peak, int(last.get("total_tokens") or 0))
                 context_window_tokens = max(
                     context_window_tokens, int(info.get("model_context_window") or 0)
                 )
                 t = int(tot.get("total_tokens") or 0)
                 if t >= best_total:
                     best_total, best_usage = t, tot
+            elif rtype == "compacted" and best_usage:
+                segment_snapshots.append(
+                    (dict(best_usage), segment_peak, set(segment_models))
+                )
+                segment_peak = 0
+                segment_models = set()
             elif rtype == "response_item" and payload.get("role") == "user":
                 for c in payload.get("content") or []:
                     if isinstance(c, dict) and c.get("type") in ("input_text", "text"):
@@ -937,12 +971,6 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
 
     if not best_usage or best_total == 0:
         return None  # no recorded usage (e.g. local models that don't report it)
-
-    # Codex's input_tokens INCLUDE the cached ones; split them so the cached
-    # slice is priced at the discounted (cache_read) rate and the rest at full.
-    input_total = int(best_usage.get("input_tokens") or 0)
-    cached = int(best_usage.get("cached_input_tokens") or 0)
-    output = int(best_usage.get("output_tokens") or 0)  # already includes reasoning
 
     # Pick the model the session mostly ran on for pricing.
     if models:
@@ -979,10 +1007,26 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         context_window_tokens=context_window_tokens,
     )
     u = session.usage_for(model)
-    cached = min(max(0, cached), max(0, input_total))
-    u.input = max(0, input_total - cached)
-    u.cache_read = cached
-    u.output = output
+    total_usage = _codex_usage_delta(best_usage)
+    u.add(total_usage)
+
+    if segment_snapshots:
+        segment_snapshots.append((dict(best_usage), segment_peak, set(segment_models)))
+        baseline: dict | None = None
+        segments: list[Segment] = []
+        for snapshot, peak, seen_models in segment_snapshots:
+            segment = Segment(
+                index=len(segments),
+                peak_tokens=peak if len(segments) < len(segment_snapshots) - 1 else 0,
+                models=seen_models or {model},
+                context_tokens=peak,
+            )
+            segment.per_model[model] = _codex_usage_delta(snapshot, baseline)
+            segments.append(segment)
+            baseline = snapshot
+        # Keep the new live slice visible even if no billable request has
+        # completed since compaction; its reset occupancy is still meaningful.
+        _finalize_contexts(session, segments, keep_empty=True)
     return session
 
 
@@ -1000,6 +1044,7 @@ def _codex_subagent(s: Session) -> SubAgent:
         effort=s.effort,
         models=set(s.models),
         per_model=dict(s.per_model),
+        segments=list(s.segments),
         context_used_tokens=s.context_used_tokens,
         peak_context_tokens=s.peak_context_tokens,
         context_window_tokens=s.context_window_tokens,

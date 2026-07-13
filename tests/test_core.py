@@ -122,6 +122,7 @@ def codex_token_count(
     input_tokens: int,
     cached_input_tokens: int,
     output_tokens: int,
+    last_tokens: int | None = None,
 ) -> dict:
     return {
         "type": "event_msg",
@@ -136,7 +137,9 @@ def codex_token_count(
                     "output_tokens": output_tokens,
                 },
                 "last_token_usage": {
-                    "total_tokens": total_tokens,
+                    "total_tokens": (
+                        total_tokens if last_tokens is None else last_tokens
+                    ),
                     "input_tokens": input_tokens,
                     "cached_input_tokens": cached_input_tokens,
                     "output_tokens": output_tokens,
@@ -181,6 +184,92 @@ def test_codex_model_ties_prefer_latest_and_cached_input_is_bounded(
     assert session.usage.input == 0
     assert session.usage.cache_read == 50
     assert session.usage.output == 10
+
+
+def test_parse_codex_rollout_splits_compacted_contexts(tmp_path: Path) -> None:
+    transcript = tmp_path / "rollout-compacted.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+            codex_token_count(
+                "2026-07-01T11:00:00Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=70,
+            ),
+            {
+                "type": "compacted",
+                "timestamp": "2026-07-01T11:01:00Z",
+                "payload": {"replacement_history": [], "window_number": 1},
+            },
+            codex_token_count(
+                "2026-07-01T11:01:01Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=5,
+            ),
+            codex_token_count(
+                "2026-07-01T11:02:00Z",
+                total_tokens=160,
+                input_tokens=130,
+                cached_input_tokens=30,
+                output_tokens=30,
+                last_tokens=25,
+            ),
+        ],
+    )
+
+    session = parse_codex_rollout(transcript, {})
+
+    assert session is not None
+    assert session.usage.total_tokens == 160
+    assert len(session.segments) == 2
+    first, second = session.segments
+    assert first.usage == Usage(input=60, cache_read=20, output=20)
+    assert first.label == "context 1 (→70)"
+    assert second.usage == Usage(input=40, cache_read=10, output=10)
+    assert second.label == "context 2 (live)"
+    assert session.context_used_tokens == 95
+    assert session.peak_context_tokens == 70
+
+
+def test_codex_compaction_surfaces_before_next_billed_turn(tmp_path: Path) -> None:
+    transcript = tmp_path / "rollout-just-compacted.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            {"type": "turn_context", "payload": {"model": "gpt-5.4"}},
+            codex_token_count(
+                "2026-07-01T11:00:00Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=70,
+            ),
+            {"type": "compacted", "payload": {"replacement_history": []}},
+            codex_token_count(
+                "2026-07-01T11:01:00Z",
+                total_tokens=100,
+                input_tokens=80,
+                cached_input_tokens=20,
+                output_tokens=20,
+                last_tokens=5,
+            ),
+        ],
+    )
+
+    session = parse_codex_rollout(transcript, {})
+
+    assert session is not None
+    assert len(session.segments) == 2
+    assert session.segments[1].usage.total_tokens == 0
+    assert session.segments[1].context_tokens == 5
 
 
 def test_parse_claude_dedupes_compacts_and_loads_subagent(tmp_path: Path) -> None:

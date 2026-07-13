@@ -57,9 +57,9 @@ By default the scanner reads Claude Code transcripts from
 - **Context used** is the sum of the peak context occupancy reached in each
   context lifetime. **Peak context** is the largest single lifetime for that
   agent. A thread's Context value adds its main agent and nested subagents.
-  Claude compaction boundaries provide distinct context lifetimes. Codex
-  records per-request context occupancy and the effective model window, but not
-  explicit compaction boundaries.
+  Both tools record compaction boundaries; Claude supplies its pre-compaction
+  occupancy directly, while Codex supplies per-request occupancy around the
+  boundary. Codex also records the effective model window.
 
 ## Terminal report reference
 
@@ -179,8 +179,8 @@ every turn re-reads the whole window. The slices always read chronologically
 (never reordered by `--sort`), and only appear when a conversation actually
 compacted. When a session has subagents too, its segments nest one level deeper,
 under `main`. In `--json`, a `segments` array (with `peak_tokens` and `trigger`)
-breaks down `base`; only Claude Code records compaction, so Codex sessions have
-none.
+breaks down `base`. Claude supplies an explicit manual/automatic trigger; Codex
+records the boundary and context occupancy but not the trigger.
 
 ### Multi-model agents
 
@@ -294,8 +294,9 @@ Codex transcripts live under `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`. A
 few things differ from Claude:
 
 - **Usage is read, not summed.** Codex writes periodic `token_count` events
-  whose `total_token_usage` is *cumulative*, so the tool just takes the final
-  running total. No per-turn summing or message-id dedup.
+  whose `total_token_usage` is *cumulative*, so the tool takes the final running
+  total. No per-turn summing or message-id dedup. At compaction boundaries,
+  adjacent cumulative snapshots are subtracted to produce context slices.
 - **Cached input is part of input.** Codex's `input_tokens` already *includes*
   the cached prompt tokens, so the tool splits them out: the cached slice goes
   in the **Cache rd** column (priced at the discounted rate), the rest in
@@ -308,6 +309,9 @@ few things differ from Claude:
   `turn_context.collaboration_mode.settings`); the last non-null value is shown
   as a `(low)` / `(medium)` / `(xhigh)` suffix on the Model column. Older
   sessions that didn't record it show no suffix.
+- **Compaction.** A `compacted` record starts a new context lifetime. The tool
+  uses `last_token_usage` to retain each lifetime's peak occupancy while
+  preserving the unchanged cumulative billed total.
 - **Subagents.** Codex writes each subagent as its own `rollout-*.jsonl` with a
   `parent_thread_id` in its `session_meta`; the tool folds these into the parent
   and shows them indented (see [Subagents](#subagents) above). The automatic
