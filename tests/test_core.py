@@ -397,7 +397,11 @@ def test_find_codex_sessions_uses_peak_cumulative_usage_and_nests_child(
             {
                 "type": "session_meta",
                 "timestamp": "2026-07-01T11:00:00Z",
-                "payload": {"id": "parent", "cwd": "/work/project"},
+                "payload": {
+                    "id": "parent",
+                    "cwd": "/work/project",
+                    "source": "cli",
+                },
             },
             {
                 "type": "turn_context",
@@ -442,6 +446,7 @@ def test_find_codex_sessions_uses_peak_cumulative_usage_and_nests_child(
                     "cwd": "/work/project",
                     "parent_thread_id": "parent",
                     "agent_nickname": "Scout",
+                    "agent_path": "/root/formats_surfaces_review",
                     "agent_role": "reviewer",
                 },
             },
@@ -481,7 +486,7 @@ def test_find_codex_sessions_uses_peak_cumulative_usage_and_nests_child(
 
     assert len(parent.subagents) == 1
     child = parent.subagents[0]
-    assert child.description == "Scout"
+    assert child.description == "Formats surfaces review"
     assert child.agent_type == "reviewer"
     assert child.primary_model == "gpt-5.4-mini"
     assert child.usage.input == 15
@@ -493,3 +498,44 @@ def test_find_codex_sessions_uses_peak_cumulative_usage_and_nests_child(
     assert parent.context_window_tokens == 1_050_000
     assert child.context_used_tokens == 30
     assert parent.timestamp == "2026-07-01T11:01:02Z"
+
+
+def test_parse_codex_rollout_reads_nested_subagent_identity(tmp_path: Path) -> None:
+    transcript = tmp_path / "rollout-child.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-01T11:00:00Z",
+                "payload": {
+                    "id": "child",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": "parent",
+                                "agent_path": "/root/ci_review",
+                                "agent_nickname": "Legacy nickname",
+                                "agent_role": "reviewer",
+                            }
+                        }
+                    },
+                },
+            },
+            {"type": "turn_context", "payload": {"model": "gpt-5.4-mini"}},
+            codex_token_count(
+                "2026-07-01T11:00:01Z",
+                total_tokens=10,
+                input_tokens=8,
+                cached_input_tokens=0,
+                output_tokens=2,
+            ),
+        ],
+    )
+
+    session = parse_codex_rollout(transcript, {})
+
+    assert session is not None
+    assert session.parent_id == "parent"
+    assert session.agent_name == "Ci review"
+    assert session.agent_role == "reviewer"

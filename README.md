@@ -143,7 +143,8 @@ recorded in the `.meta.json` sidecar (the layout on disk stays flat — a single
 lineage, not the filesystem). They're labelled by their `description` from the
 sidecar (falling back to the agent `type`, e.g. `Explore`, when none was
 recorded); Codex subagents link via `parent_thread_id` and are labelled by their
-`agent_nickname`, falling back to `(subagent)` when unnamed. Sessions with no
+humanized `agent_path` task name, falling back to `agent_nickname` and then
+`(subagent)` when unnamed. Sessions with no
 subagents stay as a single flat row. The
 **TOTAL** row and all sorting use each conversation's rollup (base + subagents)
 figure.

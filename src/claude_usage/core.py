@@ -852,6 +852,30 @@ def _codex_fallback_name(user_texts: list[str]) -> str:
     return "(untitled)"
 
 
+def _codex_spawn_metadata(payload: dict) -> dict:
+    """Return nested subagent spawn metadata when ``source`` is structured."""
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return {}
+    subagent = source.get("subagent")
+    if not isinstance(subagent, dict):
+        return {}
+    spawn = subagent.get("thread_spawn")
+    return spawn if isinstance(spawn, dict) else {}
+
+
+def _codex_agent_name(payload: dict) -> str:
+    """Prefer a subagent's stable task path over its random nickname."""
+    spawn = _codex_spawn_metadata(payload)
+    agent_path = payload.get("agent_path") or spawn.get("agent_path") or ""
+    if agent_path:
+        leaf = agent_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        label = leaf.replace("_", " ").strip()
+        if label:
+            return label[:1].upper() + label[1:]
+    return payload.get("agent_nickname") or spawn.get("agent_nickname") or ""
+
+
 def _codex_usage_delta(total: dict, baseline: dict | None = None) -> Usage:
     """Convert two cumulative Codex counters into one billed usage slice."""
     baseline = baseline or {}
@@ -927,10 +951,15 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 cwd = payload.get("cwd") or ""
                 originator = payload.get("originator") or ""
                 # A subagent rollout links back to its parent thread and carries
-                # a nickname/role; base sessions leave these empty.
-                parent_id = payload.get("parent_thread_id") or ""
-                agent_name = payload.get("agent_nickname") or ""
-                agent_role = payload.get("agent_role") or ""
+                # a task path/nickname and role; base sessions leave these empty.
+                spawn = _codex_spawn_metadata(payload)
+                parent_id = (
+                    payload.get("parent_thread_id")
+                    or spawn.get("parent_thread_id")
+                    or ""
+                )
+                agent_name = _codex_agent_name(payload)
+                agent_role = payload.get("agent_role") or spawn.get("agent_role") or ""
             elif rtype == "turn_context":
                 m = payload.get("model")
                 if m:
@@ -1033,8 +1062,9 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
 def _codex_subagent(s: Session) -> SubAgent:
     """Convert a parsed subagent rollout into a SubAgent for its parent.
 
-    The subagent's nickname is its display name; a non-default role becomes the
-    ``type:`` prefix (so the label renders like "reviewer: Aristotle").
+    The subagent's task name is its display name, falling back to its nickname;
+    a non-default role becomes the ``type:`` prefix (so the label renders like
+    "reviewer: Aristotle").
     """
     role = s.agent_role if s.agent_role.lower() not in ("", "default") else ""
     return SubAgent(
