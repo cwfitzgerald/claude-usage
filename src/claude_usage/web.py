@@ -43,15 +43,31 @@ def create_app(
             asyncio.create_task(open_browser())
         yield
 
+    # The assets are unversioned (no content hash in the URL), so without an
+    # explicit directive a browser applies *heuristic* caching and can reuse a
+    # stale copy without revalidating — silently serving a dashboard that predates
+    # the last edit. "no-cache" means "revalidate before use", which fixes that.
+    #
+    # A bare FileResponse doesn't implement conditional responses (that lives in
+    # StaticFiles), so each load re-sends the body rather than answering 304. At
+    # ~32KB total over loopback that's not worth the machinery to avoid.
+    _REVALIDATE = {"Cache-Control": "no-cache"}
+
     async def index(_: Request):
-        return FileResponse(str(static.joinpath("index.html")))
+        return FileResponse(str(static.joinpath("index.html")), headers=_REVALIDATE)
 
     async def stylesheet(_: Request):
-        return FileResponse(str(static.joinpath("app.css")), media_type="text/css")
+        return FileResponse(
+            str(static.joinpath("app.css")),
+            media_type="text/css",
+            headers=_REVALIDATE,
+        )
 
     async def script(_: Request):
         return FileResponse(
-            str(static.joinpath("app.js")), media_type="text/javascript"
+            str(static.joinpath("app.js")),
+            media_type="text/javascript",
+            headers=_REVALIDATE,
         )
 
     async def status(_: Request):

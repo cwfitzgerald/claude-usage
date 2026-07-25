@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,7 @@ PRICING: dict[str, tuple[float, float]] = {
     # model id            (input $/MTok, output $/MTok)
     "claude-fable-5": (10.0, 50.0),
     "claude-mythos-5": (10.0, 50.0),
+    "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
@@ -84,6 +86,30 @@ PRICING: dict[str, tuple[float, float]] = {
     "gpt-5.4-pro": (30.0, 180.0),
 }
 
+# ---------------------------------------------------------------------------
+# Priority ("Fast") service tier.
+#
+# Codex can send a turn on OpenAI's *priority* tier, which its own model
+# metadata calls "Fast" ("1.5x speed, increased usage"); a thread opts in via
+# ``service_tier = "priority"`` in ~/.codex/config.toml. OpenAI prices that tier
+# as a flat per-model multiple of the standard rate, applied alike to input,
+# cached input, and output — so the cache multipliers above still hold and one
+# factor per model is all we need.
+#
+# Verified against OpenAI's pricing docs (2026-07): the gpt-5.6 family and
+# gpt-5.4 double, while gpt-5.5 is the odd one out at 2.5x
+# ($5/$30 -> $12.50/$75). Anything unlisted falls back to 2x; the ``-pro``
+# variants are unverified and gpt-5.4-nano is offered on the standard tier only,
+# so a priority flag on it could only be a logging artifact and must not inflate
+# its cost.
+# ---------------------------------------------------------------------------
+PRIORITY_TIER = "priority"
+PRIORITY_MULT_DEFAULT = 2.0
+PRIORITY_MULT: dict[str, float] = {
+    "gpt-5.5": 2.5,
+    "gpt-5.4-nano": 1.0,  # no priority tier offered
+}
+
 # Models we couldn't price (e.g. synthetic ids like "<synthetic>"); recorded so
 # we can warn instead of silently treating their cost as zero.
 _UNKNOWN_MODELS: set[str] = set()
@@ -108,20 +134,43 @@ _FAMILY_LATEST = {
 }
 
 
-def price_for(model: str) -> tuple[float, float] | None:
-    """Return (input_rate, output_rate) per MTok for a model id, or None."""
+def _pricing_key(model: str) -> str | None:
+    """The :data:`PRICING` entry a model id resolves to, or None if unpriced.
+
+    Kept separate from :func:`price_for` because the resolved key — not the id as
+    logged — is what :data:`PRIORITY_MULT` is keyed on.
+    """
     if model in PRICING:
-        return PRICING[model]
+        return model
     # Tolerate dated suffixes like "claude-haiku-4-5-20251001". Try the longest
     # (most specific) known id first so "gpt-5.4-mini-<date>" matches
-    # "gpt-5.4-mini" rather than the shorter "gpt-5.4".
+    # "gpt-5.4-mini" rather than the shorter "gpt-5.4". The prefix test matters:
+    # without it "gpt-5.5-<date>" slices at the right *length* for same-length
+    # entries and resolves to whichever sorts first ("gpt-5.6"), silently pricing
+    # one model as another.
     for known in sorted(PRICING, key=len, reverse=True):
+        if not model.startswith(known):
+            continue
         suffix = model[len(known) :]
         if re.fullmatch(r"-(?:\d{8}|\d{4}-\d{2}-\d{2})", suffix):
-            return PRICING[known]
-    if model in _FAMILY_LATEST:
-        return PRICING[_FAMILY_LATEST[model]]
-    return None
+            return known
+    return _FAMILY_LATEST.get(model)
+
+
+def price_for(model: str, *, priority: bool = False) -> tuple[float, float] | None:
+    """Return (input_rate, output_rate) per MTok for a model id, or None.
+
+    ``priority`` prices the turn on the priority ("Fast") service tier, scaling
+    both rates by the model's :data:`PRIORITY_MULT` factor.
+    """
+    key = _pricing_key(model)
+    if key is None:
+        return None
+    in_rate, out_rate = PRICING[key]
+    if priority:
+        mult = PRIORITY_MULT.get(key, PRIORITY_MULT_DEFAULT)
+        return in_rate * mult, out_rate * mult
+    return in_rate, out_rate
 
 
 # Explicit short aliases for model ids too long to display comfortably. Empty
@@ -170,6 +219,22 @@ class Usage:
         self.cache_write_1h += other.cache_write_1h
         self.cache_write_other += other.cache_write_other
 
+    def minus(self, other: "Usage") -> "Usage":
+        """Field-wise difference, clamped at zero.
+
+        Used to recover the standard-tier slice of a worker whose usage partly
+        billed on the fast tier, where only the total and the fast subset are
+        stored.
+        """
+        return Usage(
+            input=max(0, self.input - other.input),
+            output=max(0, self.output - other.output),
+            cache_read=max(0, self.cache_read - other.cache_read),
+            cache_write_5m=max(0, self.cache_write_5m - other.cache_write_5m),
+            cache_write_1h=max(0, self.cache_write_1h - other.cache_write_1h),
+            cache_write_other=max(0, self.cache_write_other - other.cache_write_other),
+        )
+
     @property
     def total_tokens(self) -> int:
         return (
@@ -190,11 +255,16 @@ def sum_usage(per_model: dict[str, Usage]) -> Usage:
     return total
 
 
-def cost_of(per_model: dict[str, Usage]) -> float:
-    """Price a per-model usage map, each slice at its own model's rate."""
+def cost_of(per_model: dict[str, Usage], *, priority: bool = False) -> float:
+    """Price a per-model usage map, each slice at its own model's rate.
+
+    ``priority`` bills the whole map on the priority ("Fast") tier. It's a
+    per-worker flag rather than a per-slice one because Codex records the tier
+    per *thread*, not per request.
+    """
     total = 0.0
     for model, u in per_model.items():
-        rates = price_for(model)
+        rates = price_for(model, priority=priority)
         if rates is None:
             _UNKNOWN_MODELS.add(model)
             continue
@@ -207,6 +277,25 @@ def cost_of(per_model: dict[str, Usage]) -> float:
         # Unbroken-down cache creation: price at the 5-min rate (the common case).
         total += (u.cache_write_other / 1e6) * in_rate * CACHE_WRITE_5M_MULT
     return total
+
+
+def cost_of_tiers(
+    per_model: dict[str, Usage], priority_per_model: dict[str, Usage]
+) -> float:
+    """Price a worker whose usage split across service tiers.
+
+    ``per_model`` is the worker's total and ``priority_per_model`` the fast-tier
+    subset of it, so the standard-tier slice is their difference. A Codex thread
+    can toggle fast mode between turns, so both halves can be non-empty at once;
+    Claude workers always pass an empty subset and price entirely at standard.
+    """
+    if not priority_per_model:
+        return cost_of(per_model)
+    standard = {
+        model: usage.minus(priority_per_model.get(model, Usage()))
+        for model, usage in per_model.items()
+    }
+    return cost_of(standard) + cost_of(priority_per_model, priority=True)
 
 
 def primary_model_of(per_model: dict[str, Usage], models: set[str]) -> str:
@@ -266,6 +355,7 @@ class SubAgent:
     description: str = ""
     timestamp: str = ""
     effort: str = ""  # reasoning effort, if recorded (Codex subagents)
+    service_tier: str = ""  # OpenAI service tier, if recorded (Codex subagents)
     agent_id: str = ""  # opaque id from the agent-<id>.jsonl filename
     tool_use_id: str = ""  # the spawning tool_use's id; links this to its parent
     spawn_depth: int = 0  # 1 = spawned by the base, 2 = by a depth-1 subagent, ...
@@ -274,6 +364,8 @@ class SubAgent:
     emitted_tool_use_ids: set[str] = field(default_factory=set)
     models: set[str] = field(default_factory=set)
     per_model: dict[str, Usage] = field(default_factory=dict)
+    # The fast-tier subset of per_model (see cost_of_tiers).
+    priority_per_model: dict[str, Usage] = field(default_factory=dict)
     segments: list["Segment"] = field(default_factory=list)
     context_used_tokens: int = 0
     peak_context_tokens: int = 0
@@ -298,12 +390,21 @@ class SubAgent:
         return desc or self.agent_type or "(subagent)"
 
     @property
+    def priority(self) -> bool:
+        """True when any of this agent's usage billed on the fast tier."""
+        return any(u.total_tokens for u in self.priority_per_model.values())
+
+    @property
     def usage(self) -> Usage:
         return sum_usage(self.per_model)
 
     @property
+    def priority_usage(self) -> Usage:
+        return sum_usage(self.priority_per_model)
+
+    @property
     def cost(self) -> float:
-        return cost_of(self.per_model)
+        return cost_of_tiers(self.per_model, self.priority_per_model)
 
     @property
     def primary_model(self) -> str:
@@ -328,6 +429,9 @@ class Segment:
     trigger: str = ""  # "manual"/"auto" of that boundary; "" if still live
     models: set[str] = field(default_factory=set)
     per_model: dict[str, Usage] = field(default_factory=dict)
+    # The fast-tier subset of per_model (see cost_of_tiers). Accumulated per turn
+    # within this slice, so a slice that spans a fast-mode toggle splits too.
+    priority_per_model: dict[str, Usage] = field(default_factory=dict)
     context_tokens: int = 0
 
     def usage_for(self, model: str) -> Usage:
@@ -342,12 +446,17 @@ class Segment:
         return f"context {self.index + 1} (live)"
 
     @property
+    def priority(self) -> bool:
+        """True when any of this slice's usage billed on the fast tier."""
+        return any(u.total_tokens for u in self.priority_per_model.values())
+
+    @property
     def usage(self) -> Usage:
         return sum_usage(self.per_model)
 
     @property
     def cost(self) -> float:
-        return cost_of(self.per_model)
+        return cost_of_tiers(self.per_model, self.priority_per_model)
 
     @property
     def primary_model(self) -> str:
@@ -364,6 +473,10 @@ class Session:
     gui: bool = False  # opened in the desktop GUI (has claude-code-sessions metadata)
     timestamp: str = ""  # ISO 8601 of the last activity seen (for the Date column)
     effort: str = ""  # reasoning effort, if the tool records one (Codex only)
+    # OpenAI service tier the thread ran on: "priority" (Codex's "Fast" mode),
+    # "default", or "" when the rollout predates the record. Codex only; Claude
+    # transcripts report "standard" on every turn and have no fast-mode marker.
+    service_tier: str = ""
     # Codex subagent linkage, from the rollout's session_meta (empty otherwise);
     # used to fold a subagent rollout into its parent, then discarded.
     parent_id: str = ""
@@ -372,6 +485,8 @@ class Session:
     models: set[str] = field(default_factory=set)
     # usage accumulated per model so each slice is priced at its own rate
     per_model: dict[str, Usage] = field(default_factory=dict)
+    # The fast-tier subset of per_model (see cost_of_tiers).
+    priority_per_model: dict[str, Usage] = field(default_factory=dict)
     # subagents spawned within this session, each with its own model/usage
     subagents: list[SubAgent] = field(default_factory=list)
     # context lifetimes split at compaction boundaries; empty unless the base
@@ -395,14 +510,28 @@ class Session:
         return self.timestamp[:10]
 
     @property
+    def priority(self) -> bool:
+        """True when any of the base conversation's usage billed on the fast tier.
+
+        A thread can toggle fast mode mid-run, so this is "used fast mode at all",
+        not "is currently set to fast" — that's :attr:`service_tier`.
+        """
+        return any(u.total_tokens for u in self.priority_per_model.values())
+
+    @property
     def usage(self) -> Usage:
         """Base-conversation usage only (excludes subagents)."""
         return sum_usage(self.per_model)
 
     @property
+    def priority_usage(self) -> Usage:
+        """The base conversation's fast-tier usage only."""
+        return sum_usage(self.priority_per_model)
+
+    @property
     def cost(self) -> float:
         """Base-conversation cost only (excludes subagents)."""
-        return cost_of(self.per_model)
+        return cost_of_tiers(self.per_model, self.priority_per_model)
 
     @property
     def all_subagents(self) -> list["SubAgent"]:
@@ -428,8 +557,25 @@ class Session:
         return total
 
     @property
+    def total_priority_usage(self) -> Usage:
+        """Fast-tier usage across the whole conversation (base + subagents).
+
+        The rollup counterpart to :attr:`priority_usage`, so it sits beside
+        :attr:`total_usage` rather than mixing a base-only figure into a row whose
+        other numbers cover everything.
+        """
+        total = sum_usage(self.priority_per_model)
+        for sa in self.all_subagents:
+            total.add(sa.priority_usage)
+        return total
+
+    @property
     def total_cost(self) -> float:
-        return cost_of(self.per_model) + sum(sa.cost for sa in self.all_subagents)
+        # Each subagent prices on its own tier split: a forked child inherits the
+        # parent's tier in practice, but nothing guarantees it.
+        return cost_of_tiers(self.per_model, self.priority_per_model) + sum(
+            sa.cost for sa in self.all_subagents
+        )
 
     @property
     def total_context_used_tokens(self) -> int:
@@ -469,6 +615,66 @@ def _finalize_contexts(
         entity.segments = visible
 
 
+# A transcript's ``user`` records carry the tool-result payloads and are about
+# half the bytes on disk, while contributing nothing to this report but a
+# timestamp. Decoding them is the single largest cost of a scan, so a cheap
+# prefix test skips them without paying ``json.loads``.
+#
+# Bounds are measured, with headroom: across a 133MB corpus the nested
+# ``"role":"assistant"`` marker never appeared past offset 271, and a top-level
+# ``type`` never past 146.
+_HEAD_BYTES = 512
+
+# The value of the first ``"type":"..."`` in the head, for records we ignore
+# wholesale, written with its closing quote so a prefix test matches the whole
+# value. Only types that *are* genuinely top-level at that position belong here:
+# an ``attachment`` exposes a nested content type first (e.g. ``task_reminder``),
+# so it is deliberately absent and gets decoded normally. Kept as a tuple for
+# ``str.startswith``, which takes one directly and stays in C.
+_SKIP_TYPES = ('user"',)
+
+
+def _skippable(line: str) -> bool:
+    """True when ``line`` is positively identified as a record we ignore.
+
+    Only a *positive* identification skips. An assistant turn is recognized by
+    its nested ``"role":"assistant"`` and always decoded; a user turn by its
+    leading top-level ``type``. Anything unclassifiable from the head falls
+    through to a full decode, so an unfamiliar record shape costs a little speed
+    and never accuracy.
+
+    Takes the raw line (no ``strip()``) so a skipped record never pays for a
+    copy of its payload; a line with leading whitespace simply fails to match
+    and is decoded.
+    """
+    head = line[:_HEAD_BYTES]
+    if '"role":"assistant"' in head:
+        return False
+    i = head.find('"type":"')
+    if i < 0:
+        return False
+    return head.startswith(_SKIP_TYPES, i + 8)
+
+
+def _fold_skipped_timestamp(line: str | None, current: str) -> str:
+    """Fold a skipped record's timestamp into a running max.
+
+    Called once per file with the *last* line :func:`_skippable` skipped.
+    Transcripts are written in chronological order, so the final record carries
+    the file's newest timestamp — the one thing a skipped record can still
+    contribute (the Date column and ``--since`` both read it). Decoding one line
+    per file recovers it exactly, instead of scanning every skipped line for a
+    key that can sit hundreds of kilobytes in.
+    """
+    if not line:
+        return current
+    try:
+        ts = json.loads(line).get("timestamp")
+    except json.JSONDecodeError:
+        return current
+    return ts if ts and ts > current else current
+
+
 def parse_session(path: Path) -> Session | None:
     """Parse one .jsonl transcript into a Session, or None if it has no usage."""
     session_id = path.stem
@@ -481,6 +687,7 @@ def parse_session(path: Path) -> Session | None:
     # Assistant turns are folded into the current context lifetime; a
     # compact_boundary closes it (stamping its peak/trigger) and opens the next.
     segments: list[Segment] = [Segment()]
+    last_skipped: str | None = None
 
     try:
         fh = path.open(encoding="utf-8")
@@ -490,6 +697,9 @@ def parse_session(path: Path) -> Session | None:
 
     with fh:
         for line in fh:
+            if _skippable(line):
+                last_skipped = line
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -552,6 +762,7 @@ def parse_session(path: Path) -> Session | None:
             )
             saw_usage = True
 
+    session.timestamp = _fold_skipped_timestamp(last_skipped, session.timestamp)
     _finalize_contexts(session, segments)
 
     # Subagents live in a sibling directory named after the session id. They're
@@ -635,6 +846,7 @@ def parse_subagent(path: Path) -> SubAgent | None:
     seen_message_ids: set[str] = set()
     saw_usage = False
     segments: list[Segment] = [Segment()]
+    last_skipped: str | None = None
 
     try:
         fh = path.open(encoding="utf-8")
@@ -644,6 +856,9 @@ def parse_subagent(path: Path) -> SubAgent | None:
 
     with fh:
         for line in fh:
+            if _skippable(line):
+                last_skipped = line
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -691,6 +906,7 @@ def parse_subagent(path: Path) -> SubAgent | None:
             )
             saw_usage = True
 
+    sa.timestamp = _fold_skipped_timestamp(last_skipped, sa.timestamp)
     _finalize_contexts(sa, segments)
     return sa if saw_usage else None
 
@@ -894,6 +1110,23 @@ def _codex_usage_delta(total: dict, baseline: dict | None = None) -> Usage:
     )
 
 
+def _attribute_by_tier(
+    entity: Session | Segment, model: str, by_tier: dict[bool, Usage]
+) -> None:
+    """Record a tier-split usage bundle on a worker under one model.
+
+    ``per_model`` gets the combined total (what the token columns report) and
+    ``priority_per_model`` the fast-tier half of it, which is what makes the two
+    halves price at different rates. The fast entry is omitted when empty so
+    ``priority`` stays false for the ordinary standard-tier case.
+    """
+    combined = entity.usage_for(model)
+    combined.add(by_tier[False])
+    combined.add(by_tier[True])
+    if by_tier[True].total_tokens:
+        entity.priority_per_model[model] = by_tier[True]
+
+
 def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     """Parse one Codex rollout transcript, or None if it has no token usage."""
     session_id = path.stem
@@ -906,9 +1139,27 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     user_texts: list[str] = []
     timestamp = ""
     effort = ""  # reasoning_effort from the latest turn_context that records one
-    # token_count.total_token_usage is cumulative; keep the largest seen.
+    # service_tier from the latest thread_settings_applied that records one. Codex
+    # re-emits the whole settings block whenever it applies them, so this ends up
+    # as the tier the thread is *currently* set to — which is not necessarily the
+    # tier its earlier turns billed on (see turn_priority below).
+    service_tier = ""
+    # token_count.total_token_usage is cumulative; keep the largest seen, which
+    # doubles as the baseline each new turn's usage is measured against.
     best_total = 0
     best_usage: dict | None = None
+    # Billed usage accumulated per turn and split by service tier, keyed by
+    # "did this turn bill fast". Fast mode can be toggled mid-thread, so the split
+    # has to be recorded as the turns go by — a single after-the-fact tier could
+    # only ever be right for some of them.
+    #
+    # Fast mode applies to a whole stream, and a stream is never split here:
+    # Codex emits thread_settings_applied *before* the turn it governs (in the
+    # logs it's followed by that turn's turn_context within milliseconds), so a
+    # toggle always lands between turns and each turn bills wholly on the tier
+    # that was in effect when it ran.
+    total_by_tier: dict[bool, Usage] = {False: Usage(), True: Usage()}
+    segment_by_tier: dict[bool, Usage] = {False: Usage(), True: Usage()}
     peak_context_tokens = 0
     context_window_tokens = 0
     saw_session_meta = False
@@ -920,10 +1171,11 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
     replaying_fork = False
     fork_baseline_usage: dict | None = None
     pending_turn_context: dict | None = None
-    # Codex keeps billed usage cumulative across compaction. Capture the latest
-    # cumulative counter at each boundary, plus the peak occupancy in that
-    # context lifetime, then subtract adjacent snapshots after parsing.
-    segment_snapshots: list[tuple[dict, int, set[str]]] = []
+    pending_thread_settings: dict | None = None
+    # Codex keeps billed usage cumulative across compaction, so each context
+    # lifetime's own usage is the per-turn deltas booked while it was live, held
+    # here with that lifetime's peak occupancy and the models it ran.
+    segments_acc: list[tuple[dict[bool, Usage], int, set[str]]] = []
     segment_peak = 0
     segment_models: set[str] = set()
 
@@ -977,6 +1229,13 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                     # inter-agent trigger, so the last one in the replay is the
                     # context to retain once the copied prefix ends.
                     pending_turn_context = payload
+                elif (
+                    rtype == "event_msg"
+                    and payload.get("type") == "thread_settings_applied"
+                ):
+                    # Same story as turn_context: the replay carries the parent's
+                    # settings, then the child's own just before the trigger.
+                    pending_thread_settings = payload.get("thread_settings") or {}
                 elif rtype == "event_msg" and payload.get("type") == "token_count":
                     info = payload.get("info") or {}
                     total = info.get("total_token_usage") or {}
@@ -988,6 +1247,9 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                     "trigger_turn"
                 ):
                     replaying_fork = False
+                    tier = (pending_thread_settings or {}).get("service_tier")
+                    if tier:
+                        service_tier = tier
                     payload = pending_turn_context or {}
                     m = payload.get("model")
                     if m:
@@ -1012,6 +1274,19 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 e = settings.get("reasoning_effort")
                 if e:
                     effort = e
+            elif (
+                rtype == "event_msg"
+                and payload.get("type") == "thread_settings_applied"
+            ):
+                # Codex's "Fast" mode is OpenAI's priority tier; it bills at a
+                # multiple of the standard rate (see PRIORITY_MULT). The key can be
+                # null on threads that never had a tier (e.g. codex-auto-review),
+                # so only a real value overwrites.
+                # This record precedes the turn it governs, so it changes the tier
+                # for subsequent turns and leaves already-booked ones alone.
+                tier = (payload.get("thread_settings") or {}).get("service_tier")
+                if tier:
+                    service_tier = tier
             elif rtype == "event_msg" and payload.get("type") == "token_count":
                 info = payload.get("info") or {}
                 tot = info.get("total_token_usage") or {}
@@ -1025,11 +1300,24 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
                 )
                 t = int(tot.get("total_tokens") or 0)
                 if t >= best_total:
+                    # This snapshot advances the cumulative counter, so its gain
+                    # over the last accepted one is the turn that just finished.
+                    # Book it against the tier that turn ran on before moving the
+                    # baseline; a snapshot that doesn't advance is a replay of one
+                    # already booked, and the turn stays in flight.
+                    baseline = (
+                        best_usage if best_usage is not None else fork_baseline_usage
+                    )
+                    turn_usage = _codex_usage_delta(tot, baseline)
+                    fast = service_tier == PRIORITY_TIER
+                    total_by_tier[fast].add(turn_usage)
+                    segment_by_tier[fast].add(turn_usage)
                     best_total, best_usage = t, tot
             elif rtype == "compacted" and best_usage:
-                segment_snapshots.append(
-                    (dict(best_usage), segment_peak, set(segment_models))
+                segments_acc.append(
+                    (segment_by_tier, segment_peak, set(segment_models))
                 )
+                segment_by_tier = {False: Usage(), True: Usage()}
                 segment_peak = 0
                 segment_models = set()
             elif rtype == "response_item" and payload.get("role") == "user":
@@ -1066,6 +1354,7 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         gui="desktop" in originator.lower(),
         timestamp=timestamp,
         effort=effort,
+        service_tier=service_tier,
         parent_id=parent_id,
         agent_name=agent_name,
         agent_role=agent_role,
@@ -1074,24 +1363,22 @@ def parse_codex_rollout(path: Path, index: dict[str, str]) -> Session | None:
         peak_context_tokens=peak_context_tokens,
         context_window_tokens=context_window_tokens,
     )
-    u = session.usage_for(model)
-    total_usage = _codex_usage_delta(best_usage, fork_baseline_usage)
-    u.add(total_usage)
+    # The cumulative counter isn't split per model, so all of it is attributed to
+    # the dominant model — but it *is* split per tier, which is what pricing needs.
+    _attribute_by_tier(session, model, total_by_tier)
 
-    if segment_snapshots:
-        segment_snapshots.append((dict(best_usage), segment_peak, set(segment_models)))
-        baseline: dict | None = fork_baseline_usage
+    if segments_acc:
+        segments_acc.append((segment_by_tier, segment_peak, set(segment_models)))
         segments: list[Segment] = []
-        for snapshot, peak, seen_models in segment_snapshots:
+        for by_tier, peak, seen_models in segments_acc:
             segment = Segment(
                 index=len(segments),
-                peak_tokens=peak if len(segments) < len(segment_snapshots) - 1 else 0,
+                peak_tokens=peak if len(segments) < len(segments_acc) - 1 else 0,
                 models=seen_models or {model},
                 context_tokens=peak,
             )
-            segment.per_model[model] = _codex_usage_delta(snapshot, baseline)
+            _attribute_by_tier(segment, model, by_tier)
             segments.append(segment)
-            baseline = snapshot
         # Keep the new live slice visible even if no billable request has
         # completed since compaction; its reset occupancy is still meaningful.
         _finalize_contexts(session, segments, keep_empty=True)
@@ -1111,8 +1398,10 @@ def _codex_subagent(s: Session) -> SubAgent:
         description=s.agent_name,
         timestamp=s.timestamp,
         effort=s.effort,
+        service_tier=s.service_tier,
         models=set(s.models),
         per_model=dict(s.per_model),
+        priority_per_model=dict(s.priority_per_model),
         segments=list(s.segments),
         context_used_tokens=s.context_used_tokens,
         peak_context_tokens=s.peak_context_tokens,
@@ -1195,17 +1484,30 @@ def _usage_json(u: Usage, cost: float) -> dict:
     }
 
 
-def _per_model_json(per_model: dict[str, Usage]) -> list[dict]:
+def _per_model_json(
+    per_model: dict[str, Usage], priority_per_model: dict[str, Usage] | None = None
+) -> list[dict]:
     """Break an agent's usage out by model, each slice priced at its own rate.
 
     Always present (even for a single-model agent, as a one-element list) so a
-    consumer can attribute cost per model without re-deriving the split. The
-    sum of these slices equals the agent's own usage/cost figure.
+    consumer can attribute cost per model without re-deriving the split. Each
+    slice carries its own share of the agent's fast-tier usage, so the slices sum
+    to the agent's cost even when it toggled fast mode part-way.
     """
+    fast = priority_per_model or {}
     return [
-        {"model": model, **_usage_json(u, cost_of({model: u}))}
+        {
+            "model": model,
+            **_usage_json(u, cost_of_tiers({model: u}, fast_slice(model, fast))),
+        }
         for model, u in per_model.items()
     ]
+
+
+def fast_slice(model: str, priority_per_model: dict[str, Usage]) -> dict[str, Usage]:
+    """One model's entry from a fast-tier map, or an empty map if it has none."""
+    usage = priority_per_model.get(model)
+    return {model: usage} if usage is not None else {}
 
 
 def _tree_connectors() -> tuple[str, str, str]:
@@ -1234,16 +1536,40 @@ def _tree_label(label: str, last: bool, indent: str = "") -> str:
     return _truncate(indent + (end if last else mid) + label, 42)
 
 
-def _model_cell(primary_model: str, models: set[str], effort: str = "") -> str:
-    """Format the Model column: short id, ``+`` if mixed, ``(effort)`` if any."""
+def _fast_marker() -> str:
+    """The suffix marking a row that billed on the priority ("Fast") tier.
+
+    A lightning bolt reads at a glance, but a legacy console (e.g. Windows
+    cp1252) can't encode it, so fall back to ASCII rather than crash — the same
+    accommodation :func:`_tree_connectors` makes for the tree glyphs.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "⚡".encode(enc)
+        return " ⚡"
+    except (LookupError, UnicodeError):
+        return " fast"
+
+
+def _model_cell(
+    primary_model: str, models: set[str], effort: str = "", priority: bool = False
+) -> str:
+    """Format the Model column: short id, ``+`` if mixed, ``(effort)`` if any,
+    then a lightning bolt when the turn billed on the fast tier."""
     cell = short_model(primary_model) + ("+" if len(models) > 1 else "")
     if effort:
         cell += f" ({effort})"
+    if priority:
+        cell += _fast_marker()
     return cell
 
 
 def _agg_model_cell(
-    primary_model: str, models: set[str], per_model: dict[str, Usage], effort: str = ""
+    primary_model: str,
+    models: set[str],
+    per_model: dict[str, Usage],
+    effort: str = "",
+    priority: bool = False,
 ) -> str:
     """Model cell for an aggregate row (main / subagent / segment).
 
@@ -1253,10 +1579,19 @@ def _agg_model_cell(
     model with a ``+``. A ``+`` still appears for the Codex case of several models
     all attributed to one dominant slice (a single ``per_model`` entry, no
     breakdown), where naming that model is the only signal available.
+
+    The effort and fast-tier annotations survive either way: they describe the
+    agent, not the model, so they stay on the aggregate row even when the model
+    name drops off it.
     """
     if len(per_model) > 1:
-        return f"({effort})" if effort else ""
-    return _model_cell(primary_model, models, effort)
+        parts = []
+        if effort:
+            parts.append(f"({effort})")
+        if priority:
+            parts.append(_fast_marker().strip())
+        return " ".join(parts)
+    return _model_cell(primary_model, models, effort, priority)
 
 
 def _usage_cells(date: str, label: str, model: str, u: Usage, cost: float) -> list[str]:
@@ -1436,7 +1771,7 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         # a subagent's nested subagents), so the last-child marker is correct.
         items = _sort_per_model(entity.per_model, sort_key)
         for k, (model, u) in enumerate(items):
-            c = cost_of({model: u})
+            c = cost_of_tiers({model: u}, fast_slice(model, entity.priority_per_model))
             last = siblings_after == 0 and k == len(items) - 1
             rows.append(
                 body_row(
@@ -1463,7 +1798,12 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
                     _usage_cells(
                         "",
                         _tree_label(sg.label, last=last_seg, indent=indent),
-                        _agg_model_cell(sg.primary_model, sg.models, sg.per_model),
+                        _agg_model_cell(
+                            sg.primary_model,
+                            sg.models,
+                            sg.per_model,
+                            priority=sg.priority,
+                        ),
                         sg.usage,
                         sg.cost,
                     ),
@@ -1487,7 +1827,11 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
                     "",
                     _tree_label(sa.label, last=last, indent=prefix),
                     _agg_model_cell(
-                        sa.primary_model, sa.models, sa.per_model, sa.effort
+                        sa.primary_model,
+                        sa.models,
+                        sa.per_model,
+                        sa.effort,
+                        sa.priority,
                     ),
                     sa.usage,
                     sa.cost,
@@ -1516,14 +1860,14 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
         if not s.subagents and not segs and not base_multi:
             # Common case: one flat row for the whole (base-only, single-model)
             # conversation. A trailing "(effort)" shows the reasoning effort when
-            # recorded.
+            # recorded, and a lightning bolt marks the fast (priority) tier.
             rows.append(
                 body_row(
                     "flat",
                     _usage_cells(
                         s.date or "-",
                         _truncate(s.name, 42),
-                        _model_cell(s.primary_model, s.models, s.effort),
+                        _model_cell(s.primary_model, s.models, s.effort, s.priority),
                         s.usage,
                         s.cost,
                     ),
@@ -1565,7 +1909,11 @@ def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> 
                         "",
                         _tree_label("main", last=False),
                         _agg_model_cell(
-                            s.primary_model, s.models, s.per_model, s.effort
+                            s.primary_model,
+                            s.models,
+                            s.per_model,
+                            s.effort,
+                            s.priority,
                         ),
                         s.usage,
                         s.cost,
@@ -1658,6 +2006,23 @@ def _truncate(s: str, width: int) -> str:
     return s if len(s) <= width else s[: width - 3] + "..."
 
 
+def _visible_width(s: str) -> int:
+    """How many terminal columns a cell occupies.
+
+    ``len`` overcounts nothing but undercounts plenty: the fast-tier bolt — and
+    any emoji or CJK text in a session name — is East-Asian *Wide*, so it eats
+    two columns while counting as one code point, which would drag that row's
+    numeric cells a column left of everyone else's. Combining marks take none.
+    """
+    return sum(
+        0 if unicodedata.combining(ch) else (2 if _is_wide(ch) else 1) for ch in s
+    )
+
+
+def _is_wide(ch: str) -> bool:
+    return unicodedata.east_asian_width(ch) in ("W", "F")
+
+
 def _render(
     headers: list[str],
     rows: list[tuple[list[str], list[str]]],
@@ -1665,16 +2030,18 @@ def _render(
     color: bool = False,
 ) -> None:
     cols = len(headers)
-    widths = [len(h) for h in headers]
+    widths = [_visible_width(h) for h in headers]
     for cells, _ in [*rows, total_row]:
         for i in range(cols):
-            widths[i] = max(widths[i], len(cells[i]))
+            widths[i] = max(widths[i], _visible_width(cells[i]))
 
     def fmt(cells: list[str], styles: list[str]) -> str:
         out = []
         for i, cell in enumerate(cells):
-            # Left-align the date/name/model columns, right-align numbers.
-            padded = cell.ljust(widths[i]) if i <= 2 else cell.rjust(widths[i])
+            # Left-align the date/name/model columns, right-align numbers. Pad by
+            # hand rather than with ljust/rjust, which count code points.
+            pad = " " * max(0, widths[i] - _visible_width(cell))
+            padded = cell + pad if i <= 2 else pad + cell
             # Pad first, then wrap in the escape, so widths count visible text
             # only and each cell is colored independently of its neighbours.
             code = styles[i] if color else ""
@@ -1887,9 +2254,11 @@ def main(argv: list[str] | None = None) -> int:
             "primary_model": sa.primary_model,
             "models": sorted(sa.models),
             "effort": sa.effort or None,
+            "service_tier": sa.service_tier or None,
+            "priority_tokens": sa.priority_usage.total_tokens or None,
             **_usage_json(sa.usage, sa.cost),
             # Own usage split by model (mixed only when >1 entry).
-            "per_model": _per_model_json(sa.per_model),
+            "per_model": _per_model_json(sa.per_model, sa.priority_per_model),
             "children": [_subagent_json(c) for c in sa.children],
         }
 
@@ -1907,14 +2276,23 @@ def main(argv: list[str] | None = None) -> int:
                 "primary_model": s.primary_model,
                 "models": sorted(s.all_models),
                 "effort": s.effort or None,
-                # Top-level numbers are the whole conversation (base + subagents).
+                # "priority" is Codex's "Fast" mode, billed above the standard
+                # rate; null on tools/rollouts that don't record a tier. This is
+                # the tier the thread is *currently* set to — a thread that toggled
+                # it mid-run has usage on both, so "priority_tokens" (under "base",
+                # and per subagent) is what accounts for the cost.
+                "service_tier": s.service_tier or None,
+                # Top-level numbers are the whole conversation (base + subagents),
+                # so this is the rollup; "base" carries its own share.
+                "priority_tokens": s.total_priority_usage.total_tokens or None,
                 **_usage_json(s.total_usage, s.total_cost),
                 # Broken out so callers can attribute cost to base vs subagents;
                 # per_model splits the base's own usage by model (each priced at
                 # its own rate), surfacing any within-base model switch.
                 "base": {
+                    "priority_tokens": s.priority_usage.total_tokens or None,
                     **_usage_json(s.usage, s.cost),
-                    "per_model": _per_model_json(s.per_model),
+                    "per_model": _per_model_json(s.per_model, s.priority_per_model),
                 },
                 # Top-level subagents only; each nests its own spawned children.
                 "subagents": [_subagent_json(sa) for sa in s.subagents],
@@ -1928,8 +2306,13 @@ def main(argv: list[str] | None = None) -> int:
                         "trigger": sg.trigger or None,
                         "primary_model": sg.primary_model,
                         "models": sorted(sg.models),
+                        "priority_tokens": (
+                            sum_usage(sg.priority_per_model).total_tokens or None
+                        ),
                         **_usage_json(sg.usage, sg.cost),
-                        "per_model": _per_model_json(sg.per_model),
+                        "per_model": _per_model_json(
+                            sg.per_model, sg.priority_per_model
+                        ),
                     }
                     for sg in s.segments
                 ],

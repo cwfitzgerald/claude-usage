@@ -98,8 +98,10 @@ The **Model** column shows the (shortened) model that produced most of the
 session's tokens; a trailing `+` marks a session that used more than one model
 (broken out into per-model rows — see [Multi-model agents](#multi-model-agents)),
 and a trailing `(low)` / `(medium)` / `(xhigh)` shows the reasoning effort when
-the transcript records one (Codex only — Claude Code doesn't persist it). The
-**Date** is the last activity recorded in the transcript.
+the transcript records one (Codex only — Claude Code doesn't persist it). A
+trailing ⚡ marks a session with usage billed on the fast tier, which costs more
+per token (see [Fast mode](#fast-mode)). The **Date** is the last activity
+recorded in the transcript.
 
 ### Subagents
 
@@ -310,6 +312,8 @@ few things differ from Claude:
   `turn_context.collaboration_mode.settings`); the last non-null value is shown
   as a `(low)` / `(medium)` / `(xhigh)` suffix on the Model column. Older
   sessions that didn't record it show no suffix.
+- **Fast mode.** See [Fast mode](#fast-mode) below — it changes what a session
+  costs, not just how it's labelled.
 - **Compaction.** A `compacted` record starts a new context lifetime. The tool
   uses `last_token_usage` to retain each lifetime's peak occupancy while
   preserving the unchanged cumulative billed total.
@@ -350,16 +354,69 @@ The same formula covers OpenAI/Codex models. OpenAI cached input is 10% of the
 uncached input rate. GPT-5.6 cache writes are 1.25× input if the transcript
 reports them. Priced Codex models include GPT-5.6 Sol, Terra, and Luna (plus the
 unsuffixed Sol alias), GPT-5.5 and GPT-5.5 Pro, and GPT-5.4, mini, nano, and Pro.
-These are standard-tier list prices as of 2026-07; priority processing,
-regional uplifts, Batch/Flex discounts, and long-context surcharges are not
-modelled. Other Codex models seen in the wild (for example, a locally served
-Qwen) have no entry. The internal `codex-auto-review` model is not priced
-either; its rollouts are dropped upstream instead of producing a warning (see
-[Codex sessions](#codex-sessions)).
+These are standard-tier list prices as of 2026-07; priority processing is
+modelled (see [Fast mode](#fast-mode)), while regional uplifts, Batch/Flex
+discounts, and long-context surcharges are not. Other Codex models seen in the
+wild (for example, a locally served Qwen) have no entry. The internal
+`codex-auto-review` model is not priced either; its rollouts are dropped upstream
+instead of producing a warning (see [Codex sessions](#codex-sessions)).
 
 Models without a pricing entry are reported with `$0.00` and a stderr warning;
 add them to `PRICING` to fix. These are **list prices** and don't reflect any
 subscription/plan billing — treat the totals as an approximation, not a bill.
+
+### Fast mode
+
+Codex can run a thread on OpenAI's **priority** service tier, which its own model
+metadata calls *Fast* ("1.5× speed, increased usage"); it's enabled per-thread or
+globally via `service_tier = "priority"` in `~/.codex/config.toml`. Priority bills
+at a flat per-model multiple of the standard rate, applied alike to input, cached
+input, and output — so the cache multipliers above still hold and one factor per
+model is enough (`PRIORITY_MULT` in
+[`src/claude_usage/core.py`](src/claude_usage/core.py)):
+
+| Model                              | Priority vs standard |
+| ---------------------------------- | -------------------- |
+| GPT-5.6 Sol / Terra / Luna, GPT-5.4 | 2×                  |
+| GPT-5.5                            | 2.5×                 |
+| GPT-5.4 nano                       | n/a — standard only  |
+
+Anything unlisted falls back to 2×. The tier comes from Codex's
+`thread_settings_applied` event (`thread_settings.service_tier`). A rollout that
+never records one — anything before Codex began writing the event — is priced at
+the standard rate, as is an explicit `default`.
+
+**A thread can toggle fast mode mid-run, so the tier is applied per turn, not per
+session.** Fast mode bills a whole stream, and no stream is ever split: Codex
+writes `thread_settings_applied` *before* the turn it governs (in the logs it is
+followed by that turn's `turn_context` within milliseconds), so a toggle always
+lands between turns. Each turn therefore bills entirely on whatever tier was in
+effect when it ran, and a change never applies retroactively to turns already
+completed.
+
+Codex's token counter is cumulative, so each turn's billed usage is taken as the
+counter's advance since the previous snapshot and booked against that turn's
+tier. Summing those per-turn deltas reproduces the same totals as reading the
+final counter, so the token columns are unaffected — only the cost splits. This
+works at every level: a context slice that spans a toggle splits too, so ⚡ can
+appear on one slice of a session and not the next.
+
+A ⚡ in the Model column means "some of this billed fast", and `--json` /the
+dashboard API report `"priority_tokens"` — how many tokens billed at the fast
+rate — next to `"service_tier"`, which is only the tier the thread is set to
+*now*. On a thread that was switched off part-way those two disagree, and
+`priority_tokens` is the one that explains the cost.
+
+A forked subagent's rollout opens with a verbatim replay of its parent's history,
+including the parent's settings, so its starting tier is taken from the last
+settings record *before* the inter-agent trigger that ends the replay — the
+child's own. In practice a child inherits its parent's tier, but nothing
+guarantees it, and each subagent is priced on the tiers it actually recorded.
+
+**Claude Code has no equivalent marker.** Its transcripts report
+`message.usage.service_tier`, but it reads `standard` on every turn regardless of
+whether fast mode was on, so there is nothing to key a Claude-side adjustment
+off.
 
 ## License
 

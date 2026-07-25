@@ -150,6 +150,9 @@ tfoot td { position: sticky; bottom: 0; z-index: 2; border-bottom: 0; border-top
 .expander[aria-expanded="true"]::before { transform: rotate(90deg); }
 .identity { display: flex; align-items: center; gap: 6px; }
 .model { color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
+.fast { flex: 0 0 auto; font-size: 11px; line-height: 1; cursor: help; }
+/* In .identity the flex gap spaces the badge; a worker row's td has no gap. */
+td.model > .fast { margin-left: 4px; }
 .cost-low { color: var(--cost-low); }
 .cost-mid { color: var(--cost-mid); }
 .cost-high { color: var(--cost-high); }

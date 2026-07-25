@@ -52,12 +52,21 @@ def _context(entity: Any, *, rollup: bool = False) -> dict[str, Any]:
     }
 
 
-def _models_view(per_model: dict[str, core.Usage]) -> list[dict[str, Any]]:
+def _models_view(
+    per_model: dict[str, core.Usage],
+    priority_per_model: dict[str, core.Usage] | None = None,
+) -> list[dict[str, Any]]:
+    # Each slice carries its share of the worker's fast-tier usage, so the slices
+    # still sum to its cost when it toggled fast mode part-way through.
+    fast = priority_per_model or {}
     return [
         {
             "model": model,
             "display_model": core.short_model(model),
-            **usage_view(usage, core.cost_of({model: usage})),
+            **usage_view(
+                usage,
+                core.cost_of_tiers({model: usage}, core.fast_slice(model, fast)),
+            ),
         }
         for model, usage in sorted(per_model.items())
     ]
@@ -91,9 +100,11 @@ def agent_view(agent: core.SubAgent, *, subagent_sort: str = "cost") -> dict[str
         "display_model": core.short_model(agent.primary_model),
         "models": sorted(agent.models),
         "effort": agent.effort or None,
+        "service_tier": agent.service_tier or None,
+        "priority_tokens": agent.priority_usage.total_tokens or None,
         **_context(agent),
         **usage_view(agent.usage, agent.cost),
-        "per_model": _models_view(agent.per_model),
+        "per_model": _models_view(agent.per_model, agent.priority_per_model),
         "segments": [segment_view(segment) for segment in agent.segments],
         "children": [
             agent_view(child, subagent_sort=subagent_sort)
@@ -115,8 +126,10 @@ def segment_view(segment: core.Segment) -> dict[str, Any]:
         "context_used_tokens": segment.context_tokens or None,
         "peak_context_tokens": segment.context_tokens or None,
         "context_window_tokens": None,
+        "priority_tokens": core.sum_usage(segment.priority_per_model).total_tokens
+        or None,
         **usage_view(segment.usage, segment.cost),
-        "per_model": _models_view(segment.per_model),
+        "per_model": _models_view(segment.per_model, segment.priority_per_model),
     }
 
 
@@ -133,6 +146,13 @@ def session_summary(session: core.Session) -> dict[str, Any]:
         "display_model": core.short_model(session.primary_model),
         "models": sorted(session.all_models),
         "effort": session.effort or None,
+        # "priority" is Codex's "Fast" mode, billed above the standard rate. This
+        # is the tier the thread is currently set to; a thread that toggled it
+        # mid-run has usage on both, so "priority_tokens" is what explains cost.
+        "service_tier": session.service_tier or None,
+        # A rollup, like the usage figures below it — the base's own share is
+        # under "base" in the detail view.
+        "priority_tokens": session.total_priority_usage.total_tokens or None,
         "subagent_count": len(session.all_subagents),
         **_context(session, rollup=True),
         **usage_view(session.total_usage, session.total_cost),
@@ -151,9 +171,11 @@ def session_detail(
             "display_model": core.short_model(session.primary_model),
             "models": sorted(session.models),
             "effort": session.effort or None,
+            "service_tier": session.service_tier or None,
+            "priority_tokens": session.priority_usage.total_tokens or None,
             **_context(session),
             **usage_view(session.usage, session.cost),
-            "per_model": _models_view(session.per_model),
+            "per_model": _models_view(session.per_model, session.priority_per_model),
             "segments": [segment_view(segment) for segment in session.segments],
         },
         "subagents": [

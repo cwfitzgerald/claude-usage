@@ -119,10 +119,29 @@ function modelName(record) {
   return value(record, "display_model", "primary_model", "model") || "—";
 }
 
+// Codex's "Fast" mode is OpenAI's priority tier, billed at a multiple of the
+// standard rate — so the bolt explains why a row's cost looks high for its size.
+// Keyed on tokens actually billed fast, not on service_tier: that field is the
+// tier the thread is set to *now*, which says nothing about a thread that ran
+// fast earlier and was switched off.
+function fastBadge(record) {
+  const fast = Number(value(record, "priority_tokens")) || 0;
+  if (fast <= 0) return null;
+  const total = Number(value(record, "total_tokens")) || 0;
+  const badge = node("span", "fast", "⚡");
+  badge.title =
+    total > fast
+      ? `${formatCompact(fast)} of ${formatCompact(total)} tokens billed on the fast (priority) tier`
+      : "Fast (priority) service tier — billed above the standard rate";
+  return badge;
+}
+
 function modelCell(record) {
   const full = value(record, "primary_model", "model") || "";
   const cell = node("td", "model", modelName(record));
   if (full && full !== modelName(record)) cell.title = full;
+  const badge = fastBadge(record);
+  if (badge) cell.append(badge);
   return cell;
 }
 
@@ -168,6 +187,8 @@ function renderSummaryRow(item) {
   const fullModel = value(item, "primary_model", "model") || "";
   if (fullModel && fullModel !== modelName(item)) model.title = fullModel;
   identity.append(model);
+  const badge = fastBadge(item);
+  if (badge) identity.append(badge);
   identityCell.append(identity);
   row.append(identityCell);
 

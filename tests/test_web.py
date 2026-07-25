@@ -102,6 +102,17 @@ def test_sessions_api_filters_sorts_and_does_not_expose_paths(tmp_path: Path):
             )
             assert invalid_detail.status_code == 400
 
+            # The static assets are unversioned, so they must be revalidated on
+            # every load: without this a browser's heuristic cache can serve a
+            # dashboard older than the last edit to app.js/app.css. A conditional
+            # request still gets the full body — FileResponse has no 304 path — so
+            # the header is what does the work here.
+            for path in ("/", "/static/app.css", "/static/app.js"):
+                asset = await client.get(path)
+                assert asset.status_code == 200, path
+                assert asset.headers["cache-control"] == "no-cache", path
+                assert asset.content, path
+
     asyncio.run(exercise())
 
 
