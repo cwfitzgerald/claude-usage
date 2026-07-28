@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
-"""Summarize token usage and cost across local coding-agent sessions.
+"""Parse and price local coding-agent usage for the web dashboard.
 
-Supports multiple tools, shown side by side in one table (the **Tool** column):
+Supports Claude Code and Codex sessions:
 
 * **Claude Code** stores each session as a JSONL transcript under
   ``~/.claude/projects/<encoded-project>/<session-id>.jsonl``. Every assistant
@@ -9,29 +8,25 @@ Supports multiple tools, shown side by side in one table (the **Tool** column):
   deduplicating by API message id so a resumed/edited log isn't double-counted.
   Subagents (Task/Agent tool) each get their own transcript under
   ``<session-id>/subagents/agent-*.jsonl`` and often run a different model than
-  the base conversation, so they're parsed separately and shown as their own
-  indented rows beneath a whole-conversation rollup line. A subagent can spawn
+  the base conversation, so they're parsed separately. A subagent can spawn
   further subagents; the on-disk layout stays flat, so the tree is rebuilt from
-  each sidecar's spawning ``toolUseId`` and rendered nested to any depth.
+  each sidecar's spawning ``toolUseId``.
 
 * **Codex** stores rollout transcripts under
   ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl``. Each carries periodic
   ``token_count`` events whose ``total_token_usage`` is *cumulative*, so we
   just read the final running total — no dedup needed.
 
-Each session is priced against the model that produced it and printed in a
-table.
+Each session is priced against the model that produced it.
 """
 
 from __future__ import annotations
 
-import argparse
 import calendar
 import json
 import os
 import re
 import sys
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -114,7 +109,7 @@ PRIORITY_MULT: dict[str, float] = {
 # we can warn instead of silently treating their cost as zero.
 _UNKNOWN_MODELS: set[str] = set()
 
-# Models whose rollouts are dropped from the report entirely. Codex runs an
+# Models whose rollouts are dropped from the dashboard entirely. Codex runs an
 # automatic post-turn review pass as its own thread under the model
 # "codex-auto-review"; it's machine-internal, unpriced, and just noise here, so
 # a rollout resolved to one of these is skipped rather than shown as a $0.00 row.
@@ -616,7 +611,7 @@ def _finalize_contexts(
 
 
 # A transcript's ``user`` records carry the tool-result payloads and are about
-# half the bytes on disk, while contributing nothing to this report but a
+# half the bytes on disk, while contributing nothing to the dashboard but a
 # timestamp. Decoding them is the single largest cost of a scan, so a cheap
 # prefix test skips them without paying ``json.loads``.
 #
@@ -1453,55 +1448,13 @@ def find_codex_sessions(codex_root: Path) -> list[Session]:
     return tops
 
 
-def _fmt_int(n: int) -> str:
-    return f"{n:,}"
-
-
 def _fmt_compact(n: int) -> str:
-    """Human-readable token count for the table: 142, 45.2K, 34.5M.
-
-    Keeps small counts exact and abbreviates thousands/millions so the wide
-    cache columns stay scannable. JSON output uses the exact integer instead.
-    """
+    """Human-readable token count for context labels: 142, 45.2K, 34.5M."""
     if n < 1_000:
         return str(n)
     if n < 1_000_000:
         return f"{n / 1_000:.1f}K"
     return f"{n / 1_000_000:.1f}M"
-
-
-def _usage_json(u: Usage, cost: float) -> dict:
-    """Serialize a usage bucket + its cost to the JSON field shape."""
-    return {
-        "input_tokens": u.input,
-        "output_tokens": u.output,
-        "cache_read_tokens": u.cache_read,
-        "cache_write_tokens": (
-            u.cache_write_5m + u.cache_write_1h + u.cache_write_other
-        ),
-        "total_tokens": u.total_tokens,
-        "cost_usd": round(cost, 4),
-    }
-
-
-def _per_model_json(
-    per_model: dict[str, Usage], priority_per_model: dict[str, Usage] | None = None
-) -> list[dict]:
-    """Break an agent's usage out by model, each slice priced at its own rate.
-
-    Always present (even for a single-model agent, as a one-element list) so a
-    consumer can attribute cost per model without re-deriving the split. Each
-    slice carries its own share of the agent's fast-tier usage, so the slices sum
-    to the agent's cost even when it toggled fast mode part-way.
-    """
-    fast = priority_per_model or {}
-    return [
-        {
-            "model": model,
-            **_usage_json(u, cost_of_tiers({model: u}, fast_slice(model, fast))),
-        }
-        for model, u in per_model.items()
-    ]
 
 
 def fast_slice(model: str, priority_per_model: dict[str, Usage]) -> dict[str, Usage]:
@@ -1510,559 +1463,12 @@ def fast_slice(model: str, priority_per_model: dict[str, Usage]) -> dict[str, Us
     return {model: usage} if usage is not None else {}
 
 
-def _tree_connectors() -> tuple[str, str, str]:
-    """Return the (mid, last, vert) tree glyphs the current stdout can encode.
-
-    ``vert`` is the continuation prefix for a deeper level (segments nested
-    under ``main``). Box-drawing glyphs read best, but a legacy console (e.g.
-    Windows cp1252) can't encode them, so fall back to ASCII rather than crash.
-    """
-    enc = getattr(sys.stdout, "encoding", None) or "ascii"
-    try:
-        "├└│─".encode(enc)
-        return "├─ ", "└─ ", "│  "
-    except (LookupError, UnicodeError):
-        return "|- ", "`- ", "|  "
-
-
-def _tree_label(label: str, last: bool, indent: str = "") -> str:
-    """Prefix a child row's label with a tree connector, then truncate it.
-
-    The connector keeps the grouping visible even when color is off (piped
-    output), and marks the last child. ``indent`` nests a row one level deeper
-    (e.g. a context segment beneath ``main``).
-    """
-    mid, end, _ = _tree_connectors()
-    return _truncate(indent + (end if last else mid) + label, 42)
-
-
-def _fast_marker() -> str:
-    """The suffix marking a row that billed on the priority ("Fast") tier.
-
-    A lightning bolt reads at a glance, but a legacy console (e.g. Windows
-    cp1252) can't encode it, so fall back to ASCII rather than crash — the same
-    accommodation :func:`_tree_connectors` makes for the tree glyphs.
-    """
-    enc = getattr(sys.stdout, "encoding", None) or "ascii"
-    try:
-        "⚡".encode(enc)
-        return " ⚡"
-    except (LookupError, UnicodeError):
-        return " fast"
-
-
-def _model_cell(
-    primary_model: str, models: set[str], effort: str = "", priority: bool = False
-) -> str:
-    """Format the Model column: short id, ``+`` if mixed, ``(effort)`` if any,
-    then a lightning bolt when the turn billed on the fast tier."""
-    cell = short_model(primary_model) + ("+" if len(models) > 1 else "")
-    if effort:
-        cell += f" ({effort})"
-    if priority:
-        cell += _fast_marker()
-    return cell
-
-
-def _agg_model_cell(
-    primary_model: str,
-    models: set[str],
-    per_model: dict[str, Usage],
-    effort: str = "",
-    priority: bool = False,
-) -> str:
-    """Model cell for an aggregate row (main / subagent / segment).
-
-    When the agent's usage actually splits across >1 model it gets a per-model
-    breakdown beneath it, so the aggregate row leaves the Model column blank —
-    the same way the whole-conversation rollup line does — rather than naming one
-    model with a ``+``. A ``+`` still appears for the Codex case of several models
-    all attributed to one dominant slice (a single ``per_model`` entry, no
-    breakdown), where naming that model is the only signal available.
-
-    The effort and fast-tier annotations survive either way: they describe the
-    agent, not the model, so they stay on the aggregate row even when the model
-    name drops off it.
-    """
-    if len(per_model) > 1:
-        parts = []
-        if effort:
-            parts.append(f"({effort})")
-        if priority:
-            parts.append(_fast_marker().strip())
-        return " ".join(parts)
-    return _model_cell(primary_model, models, effort, priority)
-
-
-def _usage_cells(date: str, label: str, model: str, u: Usage, cost: float) -> list[str]:
-    """Build one table row from a usage bucket (shared by session/child rows)."""
-    # Combine all cache-write buckets into one displayed column.
-    cache_write = u.cache_write_5m + u.cache_write_1h + u.cache_write_other
-    return [
-        date,
-        label,
-        model,
-        _fmt_compact(u.input),
-        _fmt_compact(u.output),
-        _fmt_compact(u.cache_read),
-        _fmt_compact(cache_write),
-        f"${cost:,.2f}",
-    ]
-
-
-def _sort_subagents(subagents: list[SubAgent], sort_key: str) -> list[SubAgent]:
-    """Order a session's subagents by the same key as the top-level table.
-
-    ``main`` is emitted separately and always pinned first, so this only orders
-    the subagents among themselves. Unknown keys keep the spawn-time default.
-    """
-    if sort_key == "cost":
-        return sorted(subagents, key=lambda sa: sa.cost, reverse=True)
-    if sort_key == "tokens":
-        return sorted(subagents, key=lambda sa: sa.usage.total_tokens, reverse=True)
-    if sort_key == "name":
-        return sorted(subagents, key=lambda sa: sa.label.lower())
-    if sort_key == "date":
-        return sorted(subagents, key=lambda sa: sa.timestamp, reverse=True)
-    return subagents
-
-
-def _sort_per_model(
-    per_model: dict[str, Usage], sort_key: str
-) -> list[tuple[str, Usage]]:
-    """Order an agent's per-model slices for its breakdown rows.
-
-    Models carry no timestamp, so ``date`` falls back to cost (like the default);
-    ``name`` orders by the displayed short id, ``tokens`` by each slice's size.
-    """
-    items = list(per_model.items())
-    if sort_key == "tokens":
-        return sorted(items, key=lambda kv: kv[1].total_tokens, reverse=True)
-    if sort_key == "name":
-        return sorted(items, key=lambda kv: short_model(kv[0]))
-    return sorted(items, key=lambda kv: cost_of({kv[0]: kv[1]}), reverse=True)
+def _truncate(value: str, width: int) -> str:
+    return value if len(value) <= width else value[: width - 3] + "..."
 
 
 # ---------------------------------------------------------------------------
-# Terminal styling
-# ---------------------------------------------------------------------------
-
-_RESET = "\033[0m"
-
-# Column layout, referenced when styling individual cells.
-_COST_COL = 7
-_TOKEN_COLS = (3, 4, 5, 6)  # input, output, cache rd, cache wr
-
-# Base SGR parameters per row kind, so the parts of a conversation read at a
-# glance: the bold rollup is the whole-conversation headline, cyan is the base
-# ("main") agent, and the dimmed rows beneath it are its subagents. The header
-# is bold + underlined to sit apart from the body.
-_ROW_PARAMS = {
-    "header": ["1", "4"],  # bold + underline
-    "sep": ["2"],  # dim
-    "flat": [],  # a subagent-free conversation: plain default color
-    "rollup": ["1"],  # bold  — the whole-conversation total
-    "main": ["36"],  # cyan  — the base agent
-    "sub": ["2"],  # dim   — an indented subagent
-    "seg": ["2", "36"],  # dim cyan — a context lifetime of the base agent
-    "model": ["2", "35"],  # dim magenta — one model's slice of a mixed agent
-    "total": ["1"],  # bold  — the grand total
-}
-
-
-def _sgr(params: list[str]) -> str:
-    """Build an SGR escape from parameters, or "" for no styling."""
-    return f"\033[{';'.join(params)}m" if params else ""
-
-
-def _cost_params(cost: float) -> list[str]:
-    """Traffic-light color for a cost cell: cheap → green, pricey → red.
-
-    A true $0.00 (e.g. an unpriced model) is dimmed rather than colored, so it
-    reads as "no figure" instead of "cheap".
-    """
-    if cost <= 0:
-        return ["2"]  # dim
-    if cost < 5:
-        return ["32"]  # green
-    if cost < 25:
-        return ["33"]  # yellow
-    return ["31"]  # red
-
-
-def _row_styles(kind: str, cells: list[str], cost: float) -> list[str]:
-    """Per-cell SGR codes for a body/total row: kind color, plus a cost tint
-    and dimmed zeros layered on top of it."""
-    base = _ROW_PARAMS[kind]
-    bold_kind = kind in ("rollup", "total")
-    styles = []
-    for i, cell in enumerate(cells):
-        if i == _COST_COL:
-            # Keep the rollup/total bold so the tinted cost still reads as a total.
-            params = _cost_params(cost)
-            styles.append(_sgr(["1"] + params if bold_kind else params))
-        elif i in _TOKEN_COLS and cell == "0":
-            styles.append(
-                _sgr(["2"])
-            )  # dim the always-zero noise (e.g. Codex cache wr)
-        else:
-            styles.append(_sgr(base))
-    return styles
-
-
-def _enable_windows_ansi() -> None:
-    """Turn on ANSI escape processing for the Windows console (no-op elsewhere)."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-    except Exception:
-        pass
-
-
-def want_color(mode: str) -> bool:
-    """Resolve --color {auto,always,never} against the environment/TTY."""
-    if mode == "always":
-        return True
-    if mode == "never":
-        return False
-    if os.environ.get("NO_COLOR"):  # https://no-color.org/
-        return False
-    return sys.stdout.isatty()
-
-
-def print_table(sessions: list[Session], sort_key: str, color: bool = False) -> None:
-    if not sessions:
-        print("No sessions with token usage found.")
-        return
-
-    if sort_key == "cost":
-        sessions = sorted(sessions, key=lambda s: s.total_cost, reverse=True)
-    elif sort_key == "tokens":
-        sessions = sorted(
-            sessions, key=lambda s: s.total_usage.total_tokens, reverse=True
-        )
-    elif sort_key == "name":
-        sessions = sorted(sessions, key=lambda s: s.name.lower())
-    elif sort_key == "date":
-        sessions = sorted(sessions, key=lambda s: s.timestamp, reverse=True)
-
-    # Each row carries its plain cells plus a parallel list of per-cell SGR
-    # codes, so _render can pad on visible width and colorize independently.
-    def body_row(kind, cells, cost):
-        return (cells, _row_styles(kind, cells, cost))
-
-    _, _, vert = _tree_connectors()
-    blank = " " * len(vert)
-
-    def pm_child_rows(entity, child_prefix, siblings_after=0):
-        # Break a mixed-model agent's *own* usage into one row per model, each
-        # priced at its own rate, so a within-agent model switch (e.g. an opus
-        # agent that stalled and resumed on fable) is visible and auditable
-        # instead of hiding behind the aggregate row's "+". ``siblings_after``
-        # is the count of other children at this level still to be emitted (e.g.
-        # a subagent's nested subagents), so the last-child marker is correct.
-        items = _sort_per_model(entity.per_model, sort_key)
-        for k, (model, u) in enumerate(items):
-            c = cost_of_tiers({model: u}, fast_slice(model, entity.priority_per_model))
-            last = siblings_after == 0 and k == len(items) - 1
-            rows.append(
-                body_row(
-                    "model",
-                    _usage_cells(
-                        "",
-                        _tree_label(short_model(model), last=last, indent=child_prefix),
-                        short_model(model),
-                        u,
-                        c,
-                    ),
-                    c,
-                )
-            )
-
-    def seg_rows(segs, indent):
-        # Context lifetimes always read chronologically (context 1..N), never
-        # reordered by --sort: a later context above an earlier one is nonsense.
-        for j, sg in enumerate(segs):
-            last_seg = j == len(segs) - 1
-            rows.append(
-                body_row(
-                    "seg",
-                    _usage_cells(
-                        "",
-                        _tree_label(sg.label, last=last_seg, indent=indent),
-                        _agg_model_cell(
-                            sg.primary_model,
-                            sg.models,
-                            sg.per_model,
-                            priority=sg.priority,
-                        ),
-                        sg.usage,
-                        sg.cost,
-                    ),
-                    sg.cost,
-                )
-            )
-            # A segment that itself mixed models breaks down one level deeper.
-            if len(sg.per_model) > 1:
-                deeper = indent + (blank if last_seg else vert)
-                pm_child_rows(sg, deeper)
-
-    def emit_subagent(sa, prefix, last):
-        # One row for this subagent's own usage, then its per-model breakdown (if
-        # mixed) and its spawned children nested a level deeper. The prefix carries
-        # the ancestor guide lines so the tree stays legible at any depth; children
-        # follow the same --sort order.
-        rows.append(
-            body_row(
-                "sub",
-                _usage_cells(
-                    "",
-                    _tree_label(sa.label, last=last, indent=prefix),
-                    _agg_model_cell(
-                        sa.primary_model,
-                        sa.models,
-                        sa.per_model,
-                        sa.effort,
-                        sa.priority,
-                    ),
-                    sa.usage,
-                    sa.cost,
-                ),
-                sa.cost,
-            )
-        )
-        kids = _sort_subagents(sa.children, sort_key)
-        child_prefix = prefix + (blank if last else vert)
-        # Per-model rows precede the nested subagents at the same level, so they
-        # count as non-last whenever this agent also spawned children.
-        if len(sa.per_model) > 1:
-            pm_child_rows(sa, child_prefix, siblings_after=len(kids))
-        for i, k in enumerate(kids):
-            emit_subagent(k, child_prefix, i == len(kids) - 1)
-
-    rows = []
-    grand = Usage()
-    grand_cost = 0.0
-    for s in sessions:
-        grand.add(s.total_usage)
-        grand_cost += s.total_cost
-
-        segs = s.segments  # non-empty only when the base compacted (2+ slices)
-        base_multi = len(s.per_model) > 1  # base itself switched models
-        if not s.subagents and not segs and not base_multi:
-            # Common case: one flat row for the whole (base-only, single-model)
-            # conversation. A trailing "(effort)" shows the reasoning effort when
-            # recorded, and a lightning bolt marks the fast (priority) tier.
-            rows.append(
-                body_row(
-                    "flat",
-                    _usage_cells(
-                        s.date or "-",
-                        _truncate(s.name, 42),
-                        _model_cell(s.primary_model, s.models, s.effort, s.priority),
-                        s.usage,
-                        s.cost,
-                    ),
-                    s.cost,
-                )
-            )
-            continue
-
-        # An expanded conversation (subagents, compaction segments, and/or a base
-        # that mixed models): a rollup line for the whole thing, then its parts
-        # indented beneath. The rollup shows a model only when the whole
-        # conversation ran on one.
-        models = s.all_models
-        sum_model = short_model(next(iter(models))) if len(models) == 1 else ""
-        rows.append(
-            body_row(
-                "rollup",
-                _usage_cells(
-                    s.date or "-",
-                    _truncate(s.name, 42),
-                    sum_model,
-                    s.total_usage,
-                    s.total_cost,
-                ),
-                s.total_cost,
-            )
-        )
-
-        if s.subagents:
-            # The base is its own "main" row; beneath it come its context segments
-            # (if any) or — failing that — its own per-model breakdown when it
-            # mixed models. The subagent forest follows at the base level, each
-            # subagent's spawned children nested beneath it.
-            subs = _sort_subagents(s.subagents, sort_key)
-            rows.append(
-                body_row(
-                    "main",
-                    _usage_cells(
-                        "",
-                        _tree_label("main", last=False),
-                        _agg_model_cell(
-                            s.primary_model,
-                            s.models,
-                            s.per_model,
-                            s.effort,
-                            s.priority,
-                        ),
-                        s.usage,
-                        s.cost,
-                    ),
-                    s.cost,
-                )
-            )
-            if segs:
-                seg_rows(segs, vert)
-            elif base_multi:
-                pm_child_rows(s, vert)
-            for i, sa in enumerate(subs):
-                emit_subagent(sa, "", i == len(subs) - 1)
-        elif segs:
-            # No subagents: the rollup *is* the base, so its context segments
-            # (each further split by model if mixed) hang directly off it.
-            seg_rows(segs, "")
-        else:
-            # Base-only but mixed models: break the rollup down by model.
-            pm_child_rows(s, "")
-
-    headers = [
-        "Date",
-        "Session",
-        "Model",
-        "Input",
-        "Output",
-        "Cache rd",
-        "Cache wr",
-        "Cost",
-    ]
-    gw = grand.cache_write_5m + grand.cache_write_1h + grand.cache_write_other
-    total_cells = [
-        "TOTAL",
-        "",
-        "",
-        _fmt_compact(grand.input),
-        _fmt_compact(grand.output),
-        _fmt_compact(grand.cache_read),
-        _fmt_compact(gw),
-        f"${grand_cost:,.2f}",
-    ]
-    total_row = body_row("total", total_cells, grand_cost)
-
-    _render(headers, rows, total_row, color)
-    _print_averages(sessions, grand_cost, color)
-
-    if _UNKNOWN_MODELS:
-        print(
-            "\nwarning: no pricing for "
-            + ", ".join(sorted(_UNKNOWN_MODELS))
-            + " - their cost is reported as $0.00.",
-            file=sys.stderr,
-        )
-
-
-def _print_averages(sessions: list[Session], grand_cost: float, color: bool) -> None:
-    """Print per-session and per-day cost averages beneath the table.
-
-    Two day rates are shown: over *active* days (distinct dates that had a
-    session) and over the full *calendar* span (first to last date, idle days
-    included) — the two answer "cost on a day I use it" vs "run-rate".
-    """
-    n = len(sessions)
-    if not n:
-        return
-    dim = _sgr(["2"]) if color else ""
-    reset = _RESET if color else ""
-
-    by_tool = Counter(s.tool for s in sessions)
-    breakdown = ", ".join(f"{c} {tool}" for tool, c in sorted(by_tool.items()))
-    parts = [f"${grand_cost / n:,.2f} per session {dim}({n}: {breakdown}){reset}"]
-    dates = sorted(
-        dt.date() for s in sessions if (dt := parse_iso(s.timestamp)) is not None
-    )
-    if dates:
-        active = len(set(dates))
-        span = (dates[-1] - dates[0]).days + 1
-        parts.append(
-            f"${grand_cost / active:,.2f} per active day {dim}({active}){reset}"
-        )
-        parts.append(
-            f"${grand_cost / span:,.2f} per calendar day {dim}({span}d span){reset}"
-        )
-
-    print(f"{dim}Averages{reset}  " + f" {dim}·{reset} ".join(parts))
-
-
-def _truncate(s: str, width: int) -> str:
-    return s if len(s) <= width else s[: width - 3] + "..."
-
-
-def _visible_width(s: str) -> int:
-    """How many terminal columns a cell occupies.
-
-    ``len`` overcounts nothing but undercounts plenty: the fast-tier bolt — and
-    any emoji or CJK text in a session name — is East-Asian *Wide*, so it eats
-    two columns while counting as one code point, which would drag that row's
-    numeric cells a column left of everyone else's. Combining marks take none.
-    """
-    return sum(
-        0 if unicodedata.combining(ch) else (2 if _is_wide(ch) else 1) for ch in s
-    )
-
-
-def _is_wide(ch: str) -> bool:
-    return unicodedata.east_asian_width(ch) in ("W", "F")
-
-
-def _render(
-    headers: list[str],
-    rows: list[tuple[list[str], list[str]]],
-    total_row: tuple[list[str], list[str]],
-    color: bool = False,
-) -> None:
-    cols = len(headers)
-    widths = [_visible_width(h) for h in headers]
-    for cells, _ in [*rows, total_row]:
-        for i in range(cols):
-            widths[i] = max(widths[i], _visible_width(cells[i]))
-
-    def fmt(cells: list[str], styles: list[str]) -> str:
-        out = []
-        for i, cell in enumerate(cells):
-            # Left-align the date/name/model columns, right-align numbers. Pad by
-            # hand rather than with ljust/rjust, which count code points.
-            pad = " " * max(0, widths[i] - _visible_width(cell))
-            padded = cell + pad if i <= 2 else pad + cell
-            # Pad first, then wrap in the escape, so widths count visible text
-            # only and each cell is colored independently of its neighbours.
-            code = styles[i] if color else ""
-            out.append(f"{code}{padded}{_RESET}" if code else padded)
-        return "  ".join(out)
-
-    header_style = _sgr(_ROW_PARAMS["header"]) if color else ""
-    sep_style = _sgr(_ROW_PARAMS["sep"]) if color else ""
-    sep_cells = ["-" * w for w in widths]
-
-    print(fmt(headers, [header_style] * cols))
-    print(fmt(sep_cells, [sep_style] * cols))
-    for cells, styles in rows:
-        print(fmt(cells, styles))
-    print(fmt(sep_cells, [sep_style] * cols))
-    total_cells, total_styles = total_row
-    print(fmt(total_cells, total_styles))
-
-
-# ---------------------------------------------------------------------------
-# Date filtering (--since)
+# Date filtering
 # ---------------------------------------------------------------------------
 
 # Units expressible as a fixed number of seconds (months are handled separately
@@ -2109,7 +1515,7 @@ def _subtract_months(dt: datetime, months: int) -> datetime:
 
 
 def parse_since(spec: str, now: datetime) -> datetime:
-    """Resolve a --since value to a cutoff datetime (timezone-aware, UTC).
+    """Resolve a dashboard date filter to a timezone-aware UTC cutoff.
 
     Accepts a relative duration like '7d', '24h', '2w', or '3mo' (units:
     h/hours, d/days, w/weeks, mo/months) measured back from `now`, or an
@@ -2122,217 +1528,13 @@ def parse_since(spec: str, now: datetime) -> datetime:
             return _subtract_months(now, n)
         if unit in _DURATION_SECONDS:
             return now - timedelta(seconds=n * _DURATION_SECONDS[unit])
-        raise argparse.ArgumentTypeError(
-            f"unknown duration unit {unit!r} in --since {spec!r}; use h, d, w, or mo"
+        raise ValueError(
+            f"unknown duration unit {unit!r} in {spec!r}; use h, d, w, or mo"
         )
     dt = parse_iso(spec)
     if dt is not None:
         return dt
-    raise argparse.ArgumentTypeError(
-        f"could not parse --since {spec!r}; use a duration like '7d', '24h', "
+    raise ValueError(
+        f"could not parse {spec!r}; use a duration like '7d', '24h', "
         "'2w', '3mo', or an absolute date like '2026-06-01'"
     )
-
-
-def main(argv: list[str] | None = None) -> int:
-    # Prefer UTF-8 output so the tree glyphs render on a legacy Windows console;
-    # harmless where stdout is already UTF-8 or can't be reconfigured.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
-    except (AttributeError, ValueError):
-        pass
-
-    default_dir = Path(os.path.expanduser("~")) / ".claude" / "projects"
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--projects-dir",
-        type=Path,
-        default=default_dir,
-        help=f"Claude projects directory (default: {default_dir})",
-    )
-    parser.add_argument(
-        "--gui-dir",
-        type=Path,
-        default=default_gui_dir(),
-        help=(
-            "desktop app's claude-code-sessions metadata dir, used to label GUI "
-            "sessions and use their curated titles (auto-detected)"
-        ),
-    )
-    parser.add_argument(
-        "--codex-dir",
-        type=Path,
-        default=default_codex_dir(),
-        help=f"Codex sessions directory (default: {default_codex_dir()})",
-    )
-    parser.add_argument(
-        "--sort",
-        choices=["cost", "tokens", "name", "date"],
-        default="cost",
-        help=(
-            "sort order for the table (default: cost); also orders subagents "
-            "within a conversation, with 'main' always pinned first"
-        ),
-    )
-    parser.add_argument(
-        "--since",
-        metavar="WHEN",
-        help=(
-            "only include sessions active at or after WHEN: a relative duration "
-            "like '7d', '24h', '2w', '3mo' (units h/d/w/mo), or an absolute date "
-            "like '2026-06-01'"
-        ),
-    )
-    parser.add_argument(
-        "--color",
-        choices=["auto", "always", "never"],
-        default="auto",
-        help=(
-            "colorize the table to distinguish rollup / main / subagent rows "
-            "(default: auto — on only when writing to a terminal; also honors "
-            "NO_COLOR)"
-        ),
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="emit JSON instead of a table",
-    )
-    args = parser.parse_args(argv)
-
-    claude_sessions = (
-        find_sessions(args.projects_dir, args.gui_dir)
-        if args.projects_dir.is_dir()
-        else []
-    )
-    sessions = claude_sessions + (
-        find_codex_sessions(args.codex_dir) if args.codex_dir.is_dir() else []
-    )
-
-    if args.since is not None:
-        try:
-            cutoff = parse_since(args.since, datetime.now(timezone.utc))
-        except argparse.ArgumentTypeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        before = len(sessions)
-        # A session with no parseable timestamp can't be placed in the window,
-        # so it's excluded rather than silently kept.
-        sessions = [
-            s
-            for s in sessions
-            if (dt := parse_iso(s.timestamp)) is not None and dt >= cutoff
-        ]
-        print(
-            f"note: --since {args.since} -> showing {len(sessions)} of {before} "
-            f"sessions active since {cutoff.date()}.",
-            file=sys.stderr,
-        )
-
-    # A missing GUI metadata dir is a normal state (CLI-only machine), so we
-    # stay quiet about it. Only warn when the dir IS present but nothing matched
-    # — that's the surprising case worth flagging.
-    if (
-        claude_sessions
-        and not any(s.gui for s in claude_sessions)
-        and args.gui_dir.is_dir()
-    ):
-        n = len(load_gui_metadata(args.gui_dir))
-        print(
-            f"note: GUI metadata dir {args.gui_dir} has {n} entries but none "
-            f"matched a scanned transcript - all sessions treated as 'cli'.",
-            file=sys.stderr,
-        )
-
-    def _subagent_json(sa: SubAgent) -> dict:
-        # Own usage/cost only; the whole subtree is captured via nested children.
-        return {
-            "agent_type": sa.agent_type,
-            "description": sa.description,
-            "agent_id": sa.agent_id or None,
-            "spawn_depth": sa.spawn_depth or None,
-            "primary_model": sa.primary_model,
-            "models": sorted(sa.models),
-            "effort": sa.effort or None,
-            "service_tier": sa.service_tier or None,
-            "priority_tokens": sa.priority_usage.total_tokens or None,
-            **_usage_json(sa.usage, sa.cost),
-            # Own usage split by model (mixed only when >1 entry).
-            "per_model": _per_model_json(sa.per_model, sa.priority_per_model),
-            "children": [_subagent_json(c) for c in sa.children],
-        }
-
-    if args.json:
-        out = []
-        for s in sessions:
-            entry = {
-                "name": s.name,
-                "session_id": s.session_id,
-                "project": s.project,
-                "tool": s.tool,
-                "source": "gui" if s.gui else "cli",
-                "date": s.date,
-                "timestamp": s.timestamp,
-                "primary_model": s.primary_model,
-                "models": sorted(s.all_models),
-                "effort": s.effort or None,
-                # "priority" is Codex's "Fast" mode, billed above the standard
-                # rate; null on tools/rollouts that don't record a tier. This is
-                # the tier the thread is *currently* set to — a thread that toggled
-                # it mid-run has usage on both, so "priority_tokens" (under "base",
-                # and per subagent) is what accounts for the cost.
-                "service_tier": s.service_tier or None,
-                # Top-level numbers are the whole conversation (base + subagents),
-                # so this is the rollup; "base" carries its own share.
-                "priority_tokens": s.total_priority_usage.total_tokens or None,
-                **_usage_json(s.total_usage, s.total_cost),
-                # Broken out so callers can attribute cost to base vs subagents;
-                # per_model splits the base's own usage by model (each priced at
-                # its own rate), surfacing any within-base model switch.
-                "base": {
-                    "priority_tokens": s.priority_usage.total_tokens or None,
-                    **_usage_json(s.usage, s.cost),
-                    "per_model": _per_model_json(s.per_model, s.priority_per_model),
-                },
-                # Top-level subagents only; each nests its own spawned children.
-                "subagents": [_subagent_json(sa) for sa in s.subagents],
-                # Base conversation split at compaction boundaries (empty unless
-                # it compacted). peak_tokens/trigger describe the boundary that
-                # ended each slice; these sum to "base", not to the top-level.
-                "segments": [
-                    {
-                        "index": sg.index,
-                        "peak_tokens": sg.peak_tokens or None,
-                        "trigger": sg.trigger or None,
-                        "primary_model": sg.primary_model,
-                        "models": sorted(sg.models),
-                        "priority_tokens": (
-                            sum_usage(sg.priority_per_model).total_tokens or None
-                        ),
-                        **_usage_json(sg.usage, sg.cost),
-                        "per_model": _per_model_json(
-                            sg.per_model, sg.priority_per_model
-                        ),
-                    }
-                    for sg in s.segments
-                ],
-            }
-            out.append(entry)
-        json.dump(out, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        if _UNKNOWN_MODELS:
-            print(
-                "warning: no pricing for " + ", ".join(sorted(_UNKNOWN_MODELS)),
-                file=sys.stderr,
-            )
-        return 0
-
-    color = want_color(args.color)
-    if color:
-        _enable_windows_ansi()
-    print_table(sessions, args.sort, color)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

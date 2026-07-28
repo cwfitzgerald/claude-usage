@@ -73,6 +73,9 @@ def test_sessions_api_filters_sorts_and_does_not_expose_paths(tmp_path: Path):
             removed_timing_sort = await client.get("/api/v1/sessions?sort=wall")
             assert removed_timing_sort.status_code == 400
 
+            invalid_since = await client.get("/api/v1/sessions?since=tomorrowish")
+            assert invalid_since.status_code == 400
+
             hidden_project = await client.get("/api/v1/sessions?q=private-project")
             assert hidden_project.status_code == 200
             assert hidden_project.json()["items"] == []

@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-claude-usage = "claude_usage.cli:main"
+claude-usage = "claude_usage.server:main"
 
 [dependency-groups]
 dev = [

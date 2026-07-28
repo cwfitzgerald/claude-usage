@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import webbrowser
 from contextlib import asynccontextmanager
@@ -13,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from .report import (
+from .views import (
     SORT_KEYS,
     SUBAGENT_SORT_KEYS,
     filter_sessions,
@@ -90,7 +89,7 @@ def create_app(
                 tool=params.get("tool"),
                 query=params.get("q"),
             )
-        except argparse.ArgumentTypeError as exc:
+        except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         selected = sort_sessions(selected, sort, order)
         return JSONResponse(

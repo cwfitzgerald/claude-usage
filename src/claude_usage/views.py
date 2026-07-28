@@ -1,4 +1,4 @@
-"""Stable JSON views and cached-query helpers for usage sessions."""
+"""Dashboard response views and cached-query helpers for usage sessions."""
 
 from __future__ import annotations
 

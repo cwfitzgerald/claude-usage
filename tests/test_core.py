@@ -2,13 +2,9 @@ import json
 from pathlib import Path
 
 from claude_usage.core import (
-    _fast_marker,
-    _model_cell,
     _skippable,
-    _visible_width,
     cost_of,
     find_codex_sessions,
-    main,
     parse_codex_rollout,
     parse_session,
     parse_subagent,
@@ -69,45 +65,6 @@ def test_priority_tier_pricing_scales_per_model() -> None:
 
     usage = Usage(input=1_000_000, output=1_000_000, cache_read=1_000_000)
     assert cost_of({"gpt-5.6-sol": usage}, priority=True) == 71.0
-
-
-def test_fast_marker_annotates_model_cell_without_breaking_alignment() -> None:
-    """The fast tier appends a marker, and padding must count its real width.
-
-    The marker is a lightning bolt, or ASCII on a console that can't encode one,
-    so the test pins the *relationship* rather than a literal — but it pins the
-    bolt's width directly, since ``len`` calling it one column wide is exactly
-    what would drag a fast row's numbers out of line.
-    """
-    plain = _model_cell("gpt-5.6-sol", {"gpt-5.6-sol"}, "high")
-    fast = _model_cell("gpt-5.6-sol", {"gpt-5.6-sol"}, "high", priority=True)
-
-    assert plain == "gpt-5.6-sol (high)"
-    assert fast == plain + _fast_marker()
-    assert _visible_width(fast) == _visible_width(plain) + _visible_width(
-        _fast_marker()
-    )
-    assert _visible_width("⚡") == 2
-    assert _visible_width("gpt-5.6-sol") == len("gpt-5.6-sol")
-
-
-def test_report_allows_missing_claude_directory(tmp_path: Path, capsys) -> None:
-    codex_dir = tmp_path / "codex" / "sessions"
-    codex_dir.mkdir(parents=True)
-
-    result = main(
-        [
-            "--projects-dir",
-            str(tmp_path / "missing-claude"),
-            "--gui-dir",
-            str(tmp_path / "missing-gui"),
-            "--codex-dir",
-            str(codex_dir),
-        ]
-    )
-
-    assert result == 0
-    assert "No sessions with token usage found." in capsys.readouterr().out
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -556,7 +513,7 @@ def test_skipping_user_records_preserves_usage_and_final_timestamp(
     """The prefilter must skip ``user`` turns without changing any output.
 
     ``user`` records are about half the bytes on disk and hold nothing this
-    report needs except a timestamp, so they are skipped before ``json.loads``.
+    dashboard needs except a timestamp, so they are skipped before ``json.loads``.
     The newest one still has to reach the Date column, and a record the head
     can't classify must fall through to a full decode.
     """
