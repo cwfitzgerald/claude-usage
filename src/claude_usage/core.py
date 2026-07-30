@@ -71,8 +71,8 @@ PRICING: dict[str, tuple[float, float]] = {
     # that if a transcript begins reporting cache-write tokens.
     "gpt-5.6": (5.0, 30.0),  # alias for GPT-5.6 Sol
     "gpt-5.6-sol": (5.0, 30.0),
-    "gpt-5.6-terra": (2.5, 15.0),
-    "gpt-5.6-luna": (1.0, 6.0),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.2, 1.2),
     "gpt-5.5": (5.0, 30.0),
     "gpt-5.5-pro": (30.0, 180.0),
     "gpt-5.4": (2.5, 15.0),
