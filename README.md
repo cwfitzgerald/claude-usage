@@ -77,9 +77,11 @@ the base agent, nested subagents, model splits, and compaction segments.
   `token_count` event — no dedup needed.
 - Splits tokens into **input**, **output**, **cache read**, and **cache write**
   (Codex has no cache-write concept, so that column is always 0 for it).
-- Names each session by its tool's title (Claude's `ai-title`, Codex's
-  `session_index.jsonl` thread name), falling back to a summary / first prompt,
-  then `(untitled)`.
+- Names each session by its tool's title (Claude's `custom-title`, Codex's
+  `session_index.jsonl` thread name), falling back to the session's first prompt,
+  then `(untitled)`. The desktop app's curated title wins over both when present.
+  Claude's older `ai-title` and `summary` records are still read, so transcripts
+  written by earlier versions keep their names.
 - Prices each session against the model that produced it.
 
 ## Why these numbers are *lower* than the desktop app's "Breakdown"

@@ -507,6 +507,79 @@ def test_parse_claude_dedupes_compacts_and_loads_subagent(tmp_path: Path) -> Non
     assert session.total_usage.total_tokens == 34
 
 
+def name_of(path: Path, records: list[dict]) -> str:
+    """Parse a minimal transcript carrying ``records`` and return its name."""
+    write_jsonl_compact(
+        path,
+        [
+            *records,
+            claude_assistant(
+                "message-1", "2026-07-01T10:00:01Z", input_tokens=1, output_tokens=1
+            ),
+        ],
+    )
+    session = parse_session(path)
+    assert session is not None
+    return session.name
+
+
+def test_session_name_prefers_custom_title_over_older_record_shapes(
+    tmp_path: Path,
+) -> None:
+    """``custom-title`` is what Claude Code writes today, so it outranks the rest.
+
+    ``ai-title`` and ``summary`` are kept only to name transcripts written by
+    older versions; a title record can also be rewritten mid-session, in which
+    case the newest one is the current title.
+    """
+    custom = {"type": "custom-title", "customTitle": "Real title", "sessionId": "s"}
+    ai = {"type": "ai-title", "aiTitle": "Old title"}
+    summary = {"type": "summary", "summary": "Older still"}
+    prompt = {
+        "type": "last-prompt",
+        "lastPrompt": "the opening prompt",
+        "sessionId": "s",
+    }
+
+    assert name_of(tmp_path / "a" / "s.jsonl", [ai, summary, prompt, custom]) == (
+        "Real title"
+    )
+    assert name_of(tmp_path / "b" / "s.jsonl", [summary, prompt, ai]) == "Old title"
+    assert name_of(tmp_path / "c" / "s.jsonl", [prompt, summary]) == "Older still"
+
+    # A retitled session reports its latest title, not the one it started with.
+    renamed = {**custom, "customTitle": "Renamed"}
+    assert name_of(tmp_path / "d" / "s.jsonl", [custom, renamed]) == "Renamed"
+
+
+def test_session_name_falls_back_to_opening_prompt_then_untitled(
+    tmp_path: Path,
+) -> None:
+    """A session too short to be titled is still named, from its first prompt.
+
+    The prompt comes from ``last-prompt`` because ``user`` turns are never
+    decoded. Several are written per session; the first is the opening prompt.
+    """
+    first = {
+        "type": "last-prompt",
+        "lastPrompt": "Fix the flaky test",
+        "sessionId": "s",
+    }
+    later = {"type": "last-prompt", "lastPrompt": "now ship it", "sessionId": "s"}
+    assert name_of(tmp_path / "a" / "s.jsonl", [first, later]) == "Fix the flaky test"
+
+    # Long prompts are truncated, and leading blank lines skipped.
+    long_prompt = {**first, "lastPrompt": "\n\n" + "word " * 40}
+    name = name_of(tmp_path / "b" / "s.jsonl", [long_prompt])
+    assert len(name) == 60 and name.endswith("...") and name.startswith("word word")
+
+    # Nothing to name it with at all.
+    assert name_of(tmp_path / "c" / "s.jsonl", []) == "(untitled)"
+    assert name_of(tmp_path / "d" / "s.jsonl", [{**first, "lastPrompt": "  "}]) == (
+        "(untitled)"
+    )
+
+
 def test_skipping_user_records_preserves_usage_and_final_timestamp(
     tmp_path: Path,
 ) -> None:

@@ -629,6 +629,21 @@ _HEAD_BYTES = 512
 _SKIP_TYPES = ('user"',)
 
 
+def _prompt_name(prompt: str) -> str:
+    """Best-effort session name from a user prompt, or "" if it has no text.
+
+    Read from a ``last-prompt`` record rather than the ``user`` turns themselves,
+    which :func:`_skippable` deliberately never decodes. That field holds only
+    what the user typed, so unlike the Codex path there are no injected
+    instruction blocks to skip past.
+    """
+    for line in prompt.splitlines():
+        line = line.strip()
+        if line:
+            return _truncate(line, 60)
+    return ""
+
+
 def _skippable(line: str) -> bool:
     """True when ``line`` is positively identified as a record we ignore.
 
@@ -674,7 +689,12 @@ def parse_session(path: Path) -> Session | None:
     """Parse one .jsonl transcript into a Session, or None if it has no usage."""
     session_id = path.stem
     project = path.parent.name
-    name = ""
+    # Name candidates, resolved after the scan: records arrive in write order,
+    # not precedence order, so each tier is collected separately.
+    custom_title = ""  # what Claude Code writes today
+    ai_title = ""  # older transcripts
+    summary_title = ""  # older transcripts
+    prompt_title = ""  # last resort
 
     session = Session(name="", session_id=session_id, project=project, path=path)
     seen_message_ids: set[str] = set()
@@ -708,12 +728,17 @@ def parse_session(path: Path) -> Session | None:
             if ts and ts > session.timestamp:
                 session.timestamp = ts
 
-            # Session name: prefer the AI-generated title; fall back to the
-            # first user prompt if no title was ever written.
-            if rtype == "ai-title":
-                name = rec.get("aiTitle") or name
-            elif rtype == "summary" and not name:
-                name = rec.get("summary") or name
+            # Session name candidates. A title can be rewritten mid-session, so
+            # the newest title record wins; `summary` and the opening prompt are
+            # single facts about the session, so the first one wins.
+            if rtype == "custom-title":
+                custom_title = rec.get("customTitle") or custom_title
+            elif rtype == "ai-title":
+                ai_title = rec.get("aiTitle") or ai_title
+            elif rtype == "summary" and not summary_title:
+                summary_title = rec.get("summary") or ""
+            elif rtype == "last-prompt" and not prompt_title:
+                prompt_title = _prompt_name(rec.get("lastPrompt") or "")
 
             # A compaction closes the current context lifetime and starts a new
             # one. Stamp the slice we're leaving with the boundary's occupancy
@@ -771,7 +796,9 @@ def parse_session(path: Path) -> Session | None:
     if not saw_usage and not flat_subagents:
         return None
 
-    session.name = name or "(untitled)"
+    session.name = (
+        custom_title or ai_title or summary_title or prompt_title or "(untitled)"
+    )
     return session
 
 
