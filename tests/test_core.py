@@ -20,8 +20,8 @@ def test_current_openai_standard_pricing_and_model_aliases() -> None:
     expected = {
         "gpt-5.6": (5.0, 30.0),
         "gpt-5.6-sol": (5.0, 30.0),
-        "gpt-5.6-terra": (2.5, 15.0),
-        "gpt-5.6-luna": (1.0, 6.0),
+        "gpt-5.6-terra": (2.0, 12.0),
+        "gpt-5.6-luna": (0.2, 1.2),
         "gpt-5.5": (5.0, 30.0),
         "gpt-5.5-pro": (30.0, 180.0),
         "gpt-5.4": (2.5, 15.0),
@@ -52,8 +52,8 @@ def test_priority_tier_pricing_scales_per_model() -> None:
     — so a stray priority flag on it must not inflate its cost.
     """
     assert price_for("gpt-5.6-sol", priority=True) == (10.0, 60.0)
-    assert price_for("gpt-5.6-terra", priority=True) == (5.0, 30.0)
-    assert price_for("gpt-5.6-luna", priority=True) == (2.0, 12.0)
+    assert price_for("gpt-5.6-terra", priority=True) == (4.0, 24.0)
+    assert price_for("gpt-5.6-luna", priority=True) == (0.4, 2.4)
     assert price_for("gpt-5.4", priority=True) == (5.0, 30.0)
     assert price_for("gpt-5.5", priority=True) == (12.5, 75.0)
     assert price_for("gpt-5.4-nano", priority=True) == price_for("gpt-5.4-nano")
