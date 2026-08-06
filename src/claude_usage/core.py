@@ -334,6 +334,24 @@ def _context_tokens_from_usage(usage: dict) -> int:
 
 
 @dataclass
+class Turn:
+    """One billed assistant response, kept until ownership is settled.
+
+    A Claude transcript is aggregated in two steps because the same API response
+    can appear in more than one file: forking or resuming a conversation writes
+    its history into a *new* transcript. Turns are collected here first, then
+    folded into per-model and per-segment totals once
+    :func:`resolve_replays` has decided which transcript produced each one.
+    """
+
+    message_id: str  # API message.id; "" when the record carried none
+    model: str
+    usage: dict  # the raw message.usage block
+    segment: int  # index into Session.parsed_segments
+    written_by: str  # the record's own sessionId, which a replay leaves intact
+
+
+@dataclass
 class SubAgent:
     """One Task/Agent subagent spawned within a session, with its own model.
 
@@ -487,9 +505,28 @@ class Session:
     # context lifetimes split at compaction boundaries; empty unless the base
     # conversation compacted at least once (i.e. has 2+ non-empty segments)
     segments: list[Segment] = field(default_factory=list)
+    # Every context lifetime as parsed, including those `segments` hides. Kept so
+    # the totals can be recomputed after replayed turns are excluded.
+    parsed_segments: list[Segment] = field(default_factory=list)
     context_used_tokens: int = 0
     peak_context_tokens: int = 0
     context_window_tokens: int = 0
+    # --- Claude replay bookkeeping (see resolve_replays) ---
+    # Billed responses, retained until ownership across transcripts is settled.
+    turns: list[Turn] = field(default_factory=list)
+    # When this transcript was opened, from its own `queue-operation` records:
+    # replayed history keeps its original timestamps, so this is what tells an
+    # original from the copy that replays it.
+    opened_at: str = ""
+    # The session id stamped on a verbatim replayed prefix, if any. A fork copies
+    # its parent's records as they were, so they still name the parent.
+    verbatim_parent_id: str = ""
+    # Resolved by resolve_replays: where this session's replayed history was
+    # credited, why it was replayed ("fork"/"resume"), and how much was excluded.
+    replayed_from_id: str = ""
+    replayed_from_name: str = ""
+    replay_kind: str = ""
+    replayed_tokens: int = 0
 
     def usage_for(self, model: str) -> Usage:
         return self.per_model.setdefault(model, Usage())
@@ -599,8 +636,15 @@ def _finalize_contexts(
     for segment in segments:
         segment.context_tokens = max(segment.context_tokens, segment.peak_tokens)
 
-    entity.context_used_tokens = sum(s.context_tokens for s in segments)
-    entity.peak_context_tokens = max((s.context_tokens for s in segments), default=0)
+    # A lifetime with no billed request of its own describes context this worker
+    # never occupied: a fork or resumed session opens on the boundary record of
+    # the compaction its *parent* ran, whose preTokens belong to that parent's
+    # row. Only the live tail is exempt — a slice that just compacted has a real,
+    # freshly reset occupancy to report before its first request lands.
+    tail = segments[-1] if segments else None
+    counted = [s for s in segments if s.usage.total_tokens or s is tail]
+    entity.context_used_tokens = sum(s.context_tokens for s in counted)
+    entity.peak_context_tokens = max((s.context_tokens for s in counted), default=0)
     visible = (
         segments if keep_empty else [s for s in segments if s.usage.total_tokens > 0]
     )
@@ -685,6 +729,105 @@ def _fold_skipped_timestamp(line: str | None, current: str) -> str:
     return ts if ts and ts > current else current
 
 
+def aggregate_session(
+    session: Session, exclude: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Fold a session's turns into its per-model and per-segment totals.
+
+    ``exclude`` names message ids another transcript is credited with, so calling
+    this again after :func:`resolve_replays` recomputes every figure from the
+    turns that remain. Aggregates are rebuilt rather than adjusted because
+    per-lifetime occupancy is a maximum, which cannot be walked back.
+    """
+    session.models.clear()
+    session.per_model.clear()
+    for segment in session.parsed_segments:
+        segment.models.clear()
+        segment.per_model.clear()
+        segment.context_tokens = 0
+    replayed = Usage()
+
+    for turn in session.turns:
+        if turn.message_id and turn.message_id in exclude:
+            _accumulate(turn.usage, replayed)
+            continue
+        session.models.add(turn.model)
+        _accumulate(turn.usage, session.usage_for(turn.model))
+        segment = session.parsed_segments[turn.segment]
+        segment.models.add(turn.model)
+        _accumulate(turn.usage, segment.usage_for(turn.model))
+        segment.context_tokens = max(
+            segment.context_tokens, _context_tokens_from_usage(turn.usage)
+        )
+
+    session.replayed_tokens = replayed.total_tokens
+    session.segments = []
+    _finalize_contexts(session, session.parsed_segments)
+
+
+def resolve_replays(sessions: list[Session]) -> None:
+    """Credit each billed response to the transcript that produced it.
+
+    Claude Code writes a conversation's history into a *new* transcript when it
+    is forked, and again when a session is resumed after compaction, so one API
+    response can sit in several files. Deduping within a file (see
+    :func:`parse_session`) cannot see across them, so every copy would be billed
+    again — and a copied ``compact_boundary`` would add the parent's context
+    lifetime to the copy's Context total as well.
+
+    Ownership is decided per message id:
+
+    * A fork copies its parent's records verbatim, so each one still names the
+      parent in its own ``sessionId``. Only transcripts that recorded the
+      response under their *own* id can claim it.
+    * A resume re-serializes the history under the new session id, leaving
+      nothing in the record to tell copy from original — so the transcript
+      opened first is taken to be the one that produced the response.
+
+    A response no surviving transcript claims (its producer was deleted) stays
+    with whichever copy opened first, so its tokens are still reported once.
+    """
+    claude = [s for s in sessions if s.tool == "claude"]
+    holders: dict[str, list[Session]] = {}
+    claimants: dict[str, list[Session]] = {}
+    for session in claude:
+        for turn in session.turns:
+            if not turn.message_id:
+                continue
+            holders.setdefault(turn.message_id, []).append(session)
+            if turn.written_by == session.session_id:
+                claimants.setdefault(turn.message_id, []).append(session)
+
+    excluded: dict[str, set[str]] = {}
+    credited: dict[str, Counter] = {}
+    for message_id, shared in holders.items():
+        if len(shared) < 2:
+            continue
+        keeper = min(
+            claimants.get(message_id) or shared,
+            key=lambda s: (s.opened_at, s.session_id),
+        )
+        for session in shared:
+            if session is keeper:
+                continue
+            excluded.setdefault(session.session_id, set()).add(message_id)
+            credited.setdefault(session.session_id, Counter())[keeper.session_id] += 1
+
+    names = {s.session_id: s.name for s in claude}
+    for session in claude:
+        drop = excluded.get(session.session_id)
+        if not drop:
+            continue
+        aggregate_session(session, drop)
+        parent, _ = credited[session.session_id].most_common(1)[0]
+        session.replayed_from_id = parent
+        session.replayed_from_name = names.get(parent, "")
+        # A verbatim prefix is how the app writes a fork; a rewritten one is what
+        # resuming a session produces. Callers with the desktop app's metadata can
+        # still upgrade a "resume" it recorded a fork parent for.
+        session.replay_kind = "fork" if session.verbatim_parent_id else "resume"
+
+
 def parse_session(path: Path) -> Session | None:
     """Parse one .jsonl transcript into a Session, or None if it has no usage."""
     session_id = path.stem
@@ -698,11 +841,15 @@ def parse_session(path: Path) -> Session | None:
 
     session = Session(name="", session_id=session_id, project=project, path=path)
     seen_message_ids: set[str] = set()
-    saw_usage = False
     # Assistant turns are folded into the current context lifetime; a
     # compact_boundary closes it (stamping its peak/trigger) and opens the next.
     segments: list[Segment] = [Segment()]
     last_skipped: str | None = None
+    # Earliest timestamp on one of this transcript's own records, preferring a
+    # `queue-operation` — those are written as the file is opened, while replayed
+    # history keeps the timestamps it had in the transcript it came from.
+    opened_at = ""
+    first_own_record = ""
 
     try:
         fh = path.open(encoding="utf-8")
@@ -727,6 +874,19 @@ def parse_session(path: Path) -> Session | None:
             ts = rec.get("timestamp")
             if ts and ts > session.timestamp:
                 session.timestamp = ts
+
+            # Records copied in by a fork still name the transcript they were
+            # written to, which both dates this file and identifies the parent.
+            written_by = rec.get("sessionId") or ""
+            if written_by and written_by != session_id:
+                if not session.verbatim_parent_id:
+                    session.verbatim_parent_id = written_by
+            elif written_by and ts:
+                if rtype == "queue-operation":
+                    if not opened_at or ts < opened_at:
+                        opened_at = ts
+                elif not first_own_record or ts < first_own_record:
+                    first_own_record = ts
 
             # Session name candidates. A title can be rewritten mid-session, so
             # the newest title record wins; `summary` and the opening prompt are
@@ -772,18 +932,20 @@ def parse_session(path: Path) -> Session | None:
             # model — skip it so it doesn't register as a spurious extra model.
             if model == "<synthetic>":
                 continue
-            session.models.add(model)
-            _accumulate(usage, session.usage_for(model))
-            seg = segments[-1]
-            seg.models.add(model)
-            _accumulate(usage, seg.usage_for(model))
-            seg.context_tokens = max(
-                seg.context_tokens, _context_tokens_from_usage(usage)
+            session.turns.append(
+                Turn(
+                    message_id=mid or "",
+                    model=model,
+                    usage=usage,
+                    segment=len(segments) - 1,
+                    written_by=written_by,
+                )
             )
-            saw_usage = True
 
     session.timestamp = _fold_skipped_timestamp(last_skipped, session.timestamp)
-    _finalize_contexts(session, segments)
+    session.opened_at = opened_at or first_own_record
+    session.parsed_segments = segments
+    aggregate_session(session)
 
     # Subagents live in a sibling directory named after the session id. They're
     # parsed flat, then reorganized into a tree (a subagent may spawn its own).
@@ -793,7 +955,7 @@ def parse_session(path: Path) -> Session | None:
             session.timestamp = sa.timestamp
     session.subagents = nest_subagents(flat_subagents)
 
-    if not saw_usage and not flat_subagents:
+    if not session.turns and not flat_subagents:
         return None
 
     session.name = (
@@ -1034,7 +1196,45 @@ def find_sessions(projects_dir: Path, gui_dir: Path | None = None) -> list[Sessi
             if info.get("title"):
                 s.name = info["title"]
         sessions.append(s)
+    resolve_replays(sessions)
+    _apply_gui_forks(sessions, gui_meta)
     return sessions
+
+
+def _apply_gui_forks(sessions: list[Session], gui_meta: dict[str, dict]) -> None:
+    """Name a fork's parent from the desktop app's ``forkedFromSessionId``.
+
+    The app records the fork outright, which :func:`resolve_replays` can only
+    infer, and it survives the case that hides the evidence: a fork that was
+    later resumed writes a *third* transcript whose replayed prefix carries the
+    new session id, leaving it looking like a plain resume.
+
+    Fork parentage is recorded between the app's own session ids, so it resolves
+    through the CLI transcript each of those currently points at.
+    """
+    cli_ids = {
+        rec["sessionId"]: cli for cli, rec in gui_meta.items() if rec.get("sessionId")
+    }
+    titles = {
+        rec["sessionId"]: rec.get("title") or ""
+        for rec in gui_meta.values()
+        if rec.get("sessionId")
+    }
+    names = {s.session_id: s.name for s in sessions}
+    for session in sessions:
+        forked_from = (gui_meta.get(session.session_id) or {}).get(
+            "forkedFromSessionId"
+        )
+        if not forked_from:
+            continue
+        session.replay_kind = "fork"
+        if session.replayed_from_id:
+            continue
+        # Nothing of this transcript's own history was replayed elsewhere, so
+        # point at the parent conversation the app recorded.
+        parent = cli_ids.get(forked_from, "")
+        session.replayed_from_id = parent
+        session.replayed_from_name = names.get(parent) or titles.get(forked_from, "")
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from claude_usage.core import (
     _skippable,
     cost_of,
     find_codex_sessions,
+    find_sessions,
     parse_codex_rollout,
     parse_session,
     parse_subagent,
@@ -99,10 +100,12 @@ def claude_assistant(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
+    session_id: str | None = None,
 ) -> dict:
     return {
         "type": "assistant",
         "timestamp": timestamp,
+        **({"sessionId": session_id} if session_id else {}),
         "message": {
             "id": message_id,
             "model": model,
@@ -505,6 +508,291 @@ def test_parse_claude_dedupes_compacts_and_loads_subagent(tmp_path: Path) -> Non
     assert subagent.usage.total_tokens == 3
     assert subagent.context_used_tokens == 3
     assert session.total_usage.total_tokens == 34
+
+
+def claude_boundary(timestamp: str, pre_tokens: int, session_id: str) -> dict:
+    return {
+        "type": "system",
+        "subtype": "compact_boundary",
+        "timestamp": timestamp,
+        "sessionId": session_id,
+        "compactMetadata": {"preTokens": pre_tokens, "trigger": "auto"},
+    }
+
+
+def claude_opened(timestamp: str, session_id: str) -> dict:
+    """A ``queue-operation``, which is stamped when a transcript is opened."""
+    return {
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "timestamp": timestamp,
+        "sessionId": session_id,
+    }
+
+
+def test_forked_claude_session_credits_replayed_history_to_its_parent(
+    tmp_path: Path,
+) -> None:
+    """A fork's transcript opens with a verbatim copy of its parent's.
+
+    Every copied record still names the parent in its own ``sessionId``, so the
+    parent keeps those turns and the fork reports only the work it added. The
+    copied ``compact_boundary`` must not hand the fork the parent's context
+    lifetime either: the fork never ran a request inside it.
+    """
+    project = tmp_path / "projects" / "project"
+    history = [
+        claude_opened("2026-07-01T10:00:00Z", "parent"),
+        {"type": "custom-title", "sessionId": "parent", "customTitle": "Original"},
+        claude_assistant(
+            "message-1",
+            "2026-07-01T10:00:01Z",
+            input_tokens=10,
+            output_tokens=2,
+            session_id="parent",
+        ),
+        claude_boundary("2026-07-01T10:00:02Z", 500, "parent"),
+        claude_assistant(
+            "message-2",
+            "2026-07-01T10:00:03Z",
+            input_tokens=7,
+            output_tokens=3,
+            cache_read_tokens=100,
+            session_id="parent",
+        ),
+    ]
+    write_jsonl(project / "parent.jsonl", history)
+    write_jsonl(
+        project / "fork.jsonl",
+        [
+            *history,
+            claude_opened("2026-07-01T11:00:00Z", "fork"),
+            {"type": "custom-title", "sessionId": "fork", "customTitle": "The fork"},
+            claude_assistant(
+                "message-3",
+                "2026-07-01T11:00:01Z",
+                input_tokens=5,
+                output_tokens=1,
+                session_id="fork",
+            ),
+        ],
+    )
+
+    sessions = {s.session_id: s for s in find_sessions(tmp_path / "projects")}
+    parent, fork = sessions["parent"], sessions["fork"]
+
+    # The parent is untouched: both its lifetimes, and both its turns.
+    assert parent.usage == Usage(input=17, output=5, cache_read=100)
+    assert parent.context_used_tokens == 610
+    assert parent.replay_kind == ""
+
+    assert fork.usage == Usage(input=5, output=1)
+    assert fork.context_used_tokens == 6
+    assert fork.peak_context_tokens == 6
+    # One lifetime of its own, so there is no compaction to break out.
+    assert fork.segments == []
+    assert fork.replay_kind == "fork"
+    assert fork.replayed_from_id == "parent"
+    assert fork.replayed_from_name == "Original"
+    assert fork.replayed_tokens == 122
+
+
+def test_resumed_claude_session_credits_history_to_the_transcript_opened_first(
+    tmp_path: Path,
+) -> None:
+    """Resuming a session rewrites the replayed history under the new id.
+
+    Nothing in the copied records marks them as copies, so the transcript that
+    was opened first is taken to be the one that produced them.
+    """
+    project = tmp_path / "projects" / "project"
+    turn = claude_assistant(
+        "message-1", "2026-07-01T10:00:01Z", input_tokens=10, output_tokens=2
+    )
+    write_jsonl(
+        project / "first.jsonl",
+        [
+            claude_opened("2026-07-01T10:00:00Z", "first"),
+            {"type": "custom-title", "sessionId": "first", "customTitle": "Earlier"},
+            {**turn, "sessionId": "first"},
+        ],
+    )
+    write_jsonl(
+        project / "second.jsonl",
+        [
+            claude_opened("2026-07-01T12:00:00Z", "second"),
+            # The replayed turn keeps its original timestamp but is written under
+            # the resumed session's id.
+            {**turn, "sessionId": "second"},
+            claude_assistant(
+                "message-2",
+                "2026-07-01T12:00:01Z",
+                input_tokens=4,
+                output_tokens=1,
+                session_id="second",
+            ),
+        ],
+    )
+
+    sessions = {s.session_id: s for s in find_sessions(tmp_path / "projects")}
+
+    assert sessions["first"].usage == Usage(input=10, output=2)
+    assert sessions["first"].replay_kind == ""
+    assert sessions["second"].usage == Usage(input=4, output=1)
+    assert sessions["second"].replay_kind == "resume"
+    assert sessions["second"].replayed_from_name == "Earlier"
+    assert sessions["second"].replayed_tokens == 12
+
+
+def write_gui_metadata(gui_dir: Path, records: list[dict]) -> None:
+    for record in records:
+        path = gui_dir / "install" / "workspace" / f"{record['sessionId']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_desktop_metadata_marks_a_fork_whose_transcript_lost_the_evidence(
+    tmp_path: Path,
+) -> None:
+    """Resuming a fork writes a transcript that looks like any other resume.
+
+    The replayed prefix carries the resumed session's own id, so only the desktop
+    app's ``forkedFromSessionId`` still says the conversation is a fork. It links
+    the app's own session ids, which resolve through the transcript each points at.
+    """
+    project = tmp_path / "projects" / "project"
+    turn = claude_assistant(
+        "message-1", "2026-07-01T10:00:01Z", input_tokens=10, output_tokens=2
+    )
+    write_jsonl(
+        project / "first.jsonl",
+        [
+            claude_opened("2026-07-01T10:00:00Z", "first"),
+            {**turn, "sessionId": "first"},
+        ],
+    )
+    write_jsonl(
+        project / "second.jsonl",
+        [
+            claude_opened("2026-07-01T12:00:00Z", "second"),
+            {**turn, "sessionId": "second"},
+            claude_assistant(
+                "message-2",
+                "2026-07-01T12:00:01Z",
+                input_tokens=4,
+                output_tokens=1,
+                session_id="second",
+            ),
+        ],
+    )
+    gui_dir = tmp_path / "gui"
+    write_gui_metadata(
+        gui_dir,
+        [
+            {"sessionId": "local_1", "cliSessionId": "first", "title": "Original"},
+            {
+                "sessionId": "local_2",
+                "cliSessionId": "second",
+                "title": "The fork",
+                "forkedFromSessionId": "local_1",
+            },
+        ],
+    )
+
+    sessions = {s.session_id: s for s in find_sessions(tmp_path / "projects", gui_dir)}
+
+    assert sessions["second"].name == "The fork"
+    assert sessions["second"].replay_kind == "fork"
+    # Resolution found the transcript the turn was actually credited to, which is
+    # more specific than the parent conversation the app records.
+    assert sessions["second"].replayed_from_id == "first"
+    assert sessions["second"].replayed_from_name == "Original"
+
+
+def test_desktop_metadata_names_the_parent_of_a_fork_that_replayed_nothing(
+    tmp_path: Path,
+) -> None:
+    """A fork taken before the parent's first response has nothing to exclude."""
+    project = tmp_path / "projects" / "project"
+    write_jsonl(
+        project / "parent.jsonl",
+        [
+            claude_opened("2026-07-01T10:00:00Z", "parent"),
+            claude_assistant(
+                "message-1",
+                "2026-07-01T10:00:01Z",
+                input_tokens=10,
+                output_tokens=2,
+                session_id="parent",
+            ),
+        ],
+    )
+    write_jsonl(
+        project / "fork.jsonl",
+        [
+            claude_opened("2026-07-01T11:00:00Z", "fork"),
+            claude_assistant(
+                "message-2",
+                "2026-07-01T11:00:01Z",
+                input_tokens=4,
+                output_tokens=1,
+                session_id="fork",
+            ),
+        ],
+    )
+    gui_dir = tmp_path / "gui"
+    write_gui_metadata(
+        gui_dir,
+        [
+            {"sessionId": "local_1", "cliSessionId": "parent", "title": "Original"},
+            {
+                "sessionId": "local_2",
+                "cliSessionId": "fork",
+                "title": "The fork",
+                "forkedFromSessionId": "local_1",
+            },
+        ],
+    )
+
+    sessions = {s.session_id: s for s in find_sessions(tmp_path / "projects", gui_dir)}
+
+    fork = sessions["fork"]
+    assert fork.usage == Usage(input=4, output=1)
+    assert fork.replayed_tokens == 0
+    assert fork.replay_kind == "fork"
+    assert fork.replayed_from_id == "parent"
+    assert fork.replayed_from_name == "Original"
+
+
+def test_inherited_compact_boundary_is_not_counted_as_context(tmp_path: Path) -> None:
+    """A transcript can open on the boundary of a compaction it never ran.
+
+    ``preTokens`` then measures a window another session filled, so the lifetime
+    it closes contributes nothing here — unlike the Codex live tail, which
+    reports its own freshly reset occupancy before its first request lands.
+    """
+    transcript = tmp_path / "project" / "resumed.jsonl"
+    write_jsonl(
+        transcript,
+        [
+            claude_opened("2026-07-01T12:00:00Z", "resumed"),
+            claude_boundary("2026-07-01T10:00:02Z", 900, "resumed"),
+            claude_assistant(
+                "message-1",
+                "2026-07-01T12:00:01Z",
+                input_tokens=10,
+                output_tokens=2,
+                session_id="resumed",
+            ),
+        ],
+    )
+
+    session = parse_session(transcript)
+
+    assert session is not None
+    assert session.context_used_tokens == 12
+    assert session.peak_context_tokens == 12
+    assert session.segments == []
 
 
 def name_of(path: Path, records: list[dict]) -> str:
