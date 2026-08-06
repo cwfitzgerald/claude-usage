@@ -47,7 +47,11 @@ the base agent, nested subagents, model splits, and compaction segments.
 - **Context used** is the sum of the peak context occupancy reached in each
   context lifetime. **Peak context** is the largest single lifetime for that
   agent. A conversation's Context value includes its base agent and all nested
-  subagents.
+  subagents. A lifetime the conversation never ran a request in doesn't count —
+  see [Forks and resumed sessions](#forks-and-resumed-sessions).
+- A **fork / resume chip** next to a session name means its transcript opens
+  with a copy of another session's history. The tooltip names that session and
+  says how many tokens were counted there instead.
 - **Subagent rows** contain that agent's own usage. A conversation's summary
   rolls up the base agent and every subagent, including nested descendants.
 - **Compaction segments** are chronological context lifetimes. Their context
@@ -63,6 +67,9 @@ the base agent, nested subagents, model splits, and compaction segments.
   Codex rollout (`sessions/YYYY/MM/DD/rollout-*.jsonl`).
 - **Claude:** sums each assistant turn's `message.usage`, deduplicating by API
   message id so resumed/replayed logs aren't double-counted.
+- **Forks and resumes:** credits a response that appears in more than one
+  transcript to the session that produced it, so a fork reports only the work it
+  added. See [Forks and resumed sessions](#forks-and-resumed-sessions).
 - **Subagents:** parses each subagent transcript separately (they often run a
   different model), pricing each at its own rate and showing them indented under
   a whole-conversation rollup line — nested to any depth when a subagent spawns
@@ -107,13 +114,58 @@ multiple lines, and **none** of them carried differing usage between those lines
 — confirming the duplicates are always the same response re-rendered, never
 distinct billed calls. Deduping never drops real tokens.
 
+A forked or resumed conversation widens the same gap, since its transcript
+repeats history the parent already reported; see
+[Forks and resumed sessions](#forks-and-resumed-sessions).
+
+## Forks and resumed sessions
+
+Claude Code writes a conversation's history into a **new** transcript when it is
+forked, and again when a session is resumed after compaction. The copy carries
+the original responses, message ids and all — so the same API call sits in two
+files, and deduping within one file can't see it. Left alone, a fork's row
+repeats every token its parent already reported: in one measured case a fork
+showed 21.5M tokens and $19.25 where only 2.9M and $3.32 were its own.
+
+Each response is therefore credited to exactly one transcript:
+
+- A **fork** copies its parent's records verbatim, so each one still names the
+  parent in its own `sessionId`. Only a transcript that recorded a response under
+  its *own* id can claim it.
+- A **resume** re-serializes the history under the new session id, leaving
+  nothing in the record to tell the copy from the original. The transcript opened
+  first — dated by its own `queue-operation` records, which are stamped as the
+  file is created while replayed history keeps its original timestamps — is taken
+  to be the one that produced the response.
+- If no surviving transcript claims a response (its producer was deleted), the
+  earliest copy keeps it, so the tokens are still reported once.
+
+The copied history also carries the parent's `compact_boundary`, whose
+`preTokens` measure a context window the *parent* filled. So a context lifetime
+with no billed request of its own contributes nothing to Context: a fork that
+opens on an inherited boundary is not credited with the occupancy that reached
+it. A lifetime the session did run requests in is counted in full, inherited
+history included — that context really was resident. The one exception is a live
+tail: a slice that just compacted reports its freshly reset occupancy before its
+first response lands.
+
+The desktop app records forks outright, as `forkedFromSessionId` in its session
+metadata (see [Claude Desktop metadata](#claude-desktop-metadata)). That's read
+where available, because it survives the case that erases the on-disk evidence: a
+fork that is later resumed writes a third transcript whose replayed prefix
+carries the new session id, leaving it indistinguishable from a plain resume.
+
+**Codex** has the same shape and was already handled — a forked rollout opens
+with a replay of its parent's history, ended by an inter-agent trigger record.
+
 ## Claude Desktop metadata
 
 The desktop app ("Cowork" / Claude Code in the GUI) doesn't keep separate token
 data — it runs the bundled CLI, so its transcripts land in the **same**
 `~/.claude/projects/` directory and are already counted. The app only adds a
-metadata layer (curated title, cwd, model), keyed by the CLI session id, in the
-desktop app's data dir. The tool checks the known locations:
+metadata layer (curated title, cwd, model, and the parent of a forked
+conversation), keyed by the CLI session id, in the desktop app's data dir. The
+tool checks the known locations:
 
 - `%APPDATA%\Claude\claude-code-sessions` — normal Windows install.
 - `%LOCALAPPDATA%\Packages\Claude*\LocalCache\Roaming\Claude\claude-code-sessions`
@@ -121,9 +173,10 @@ desktop app's data dir. The tool checks the known locations:
   app's `%APPDATA%` into its package container.
 - `~/Library/Application Support/Claude/claude-code-sessions` — macOS.
 
-It uses the first that exists to prefer the app's curated session title. Point
-it elsewhere with `--gui-dir`. If no metadata directory exists, the transcript
-title is used instead and the cost figures are unaffected.
+It uses the first that exists to prefer the app's curated session title and to
+read fork parentage. Point it elsewhere with `--gui-dir`. If no metadata
+directory exists, the transcript title is used instead and the cost figures are
+unaffected.
 
 ## Codex sessions
 
