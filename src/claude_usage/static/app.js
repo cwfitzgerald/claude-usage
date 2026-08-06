@@ -136,6 +136,22 @@ function fastBadge(record) {
   return badge;
 }
 
+// Forking or resuming a conversation starts a new transcript that opens with a
+// copy of the parent's history. Those turns are billed to the parent's row, so
+// the chip says where this row's missing history went.
+function replayBadge(item) {
+  const kind = value(item, "replay_kind");
+  if (!kind) return null;
+  const parent = value(item, "replayed_from");
+  const dropped = Number(value(item, "replayed_tokens")) || 0;
+  const badge = node("span", "replay", kind);
+  const of = parent ? ` of “${parent}”` : "";
+  badge.title = dropped
+    ? `Opens with a replay${of} — ${formatCompact(dropped)} tokens counted on that row, not this one`
+    : `${kind === "fork" ? "Forked" : "Resumed"}${of}`;
+  return badge;
+}
+
 function modelCell(record) {
   const full = value(record, "primary_model", "model") || "";
   const cell = node("td", "model", modelName(record));
@@ -175,6 +191,8 @@ function renderSummaryRow(item) {
   button.setAttribute("aria-expanded", String(expanded.has(key)));
   button.setAttribute("aria-label", `${expanded.has(key) ? "Collapse" : "Expand"} ${value(item, "name") || "session"}`);
   wrap.append(button, node("span", "", value(item, "name") || "(untitled)"));
+  const replay = replayBadge(item);
+  if (replay) wrap.append(replay);
   sessionCell.title = value(item, "name") || "";
   sessionCell.append(wrap);
   row.append(sessionCell);

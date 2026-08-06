@@ -153,6 +153,11 @@ def session_summary(session: core.Session) -> dict[str, Any]:
         # A rollup, like the usage figures below it — the base's own share is
         # under "base" in the detail view.
         "priority_tokens": session.total_priority_usage.total_tokens or None,
+        # This transcript opens with a replay of another session's history
+        # ("fork"/"resume"), whose tokens are counted on that session's row.
+        "replay_kind": session.replay_kind or None,
+        "replayed_from": session.replayed_from_name or None,
+        "replayed_tokens": session.replayed_tokens or None,
         "subagent_count": len(session.all_subagents),
         **_context(session, rollup=True),
         **usage_view(session.total_usage, session.total_cost),
