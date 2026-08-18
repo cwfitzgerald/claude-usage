@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "schedule:weekly"],
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 20,
+  "prHourlyLimit": 200,
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "recreateWhen": "always",
+    "rebaseWhen": "conflicted",
+    "branchTopic": "uv.lock update",
+    "commitMessageAction": "Update uv.lock",
+    "schedule": ["before 4am on monday"],
+    "prBodyDefinitions": {
+      "Change": "All locks refreshed"
+    }
+  },
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["minor", "patch"],
+      "enabled": false,
+      "description": "Compatible updates are handled by lockFileMaintenance"
+    }
+  ]
+}
